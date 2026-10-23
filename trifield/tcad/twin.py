@@ -247,11 +247,11 @@ def warm_ramp(prefix: str, vd: float) -> str:
             "\t){ Coupled{ Poisson Electron Hole } }")
 
 
-def neighbour_ramp(prefix: str, vg: float, vd: float) -> str:
+def neighbour_ramp(prefix: str, vg: float, vd: float, initial: float = 0.1, max_step: float = 0.25) -> str:
     """Continue from a converged solution of this twin at a nearby bias: load it and ramp the
     electrodes to the target (the deck's electrode block carries the loaded point's bias)."""
     return (f'\tLoad(FilePrefix= "{prefix}")\n'
-            "\tQuasistationary(\n\t\tInitialStep= 0.1 MinStep= 1e-6 MaxStep= 0.25\n"
+            f"\tQuasistationary(\n\t\tInitialStep= {initial} MinStep= 1e-6 MaxStep= {max_step}\n"
             f'\t\tGoal{{ Name="G" Voltage= {vg:.6g} }} Goal{{ Name="D" Voltage= {vd:.6g} }}\n'
             "\t){ Coupled{ Poisson Electron Hole } }")
 
@@ -279,7 +279,7 @@ class Twin:
                  anchor_before_refine: bool = False, refine_config=None, feature_version: int | None = None,
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
                  metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
-                 trap_calibration: bool = True):
+                 trap_calibration: bool = True, ramp_race: tuple | None = None):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -305,6 +305,8 @@ class Twin:
         self.refine_escalate = refine_escalate
         # continue a failed warm point from the twin's nearest converged solution before cold-starting
         self.neighbour_ramp = neighbour_ramp
+        # race the default neighbour ramp against one with these (InitialStep, MaxStep); None = default only
+        self.ramp_race = ramp_race
         # write the contact-metal Fermi-potential drop into every guess (needs the physics export)
         self.metal_state = metal_state
         # Vth search: "legacy" brackets at 0/-2/-4/-6 V (the -2 V point is a deep off-state warm start: neighbour
@@ -555,6 +557,48 @@ class Twin:
             self.timing["guess"] += time.monotonic() - t0
 
     # ---- one bias point ----------------------------------------------------------
+    def _sdevice_race(self, entries: list[tuple[str, str]]) -> tuple[float | None, dict, str | None]:
+        """Run several decks at once; the first that converges wins and the others are killed.
+        Neighbour ramps vary by >10x in cost with the step size, differently per bias point, so racing
+        the default ramp against an aggressive one costs one extra process and returns the faster."""
+        import subprocess
+        work = self.run_dir / "twin"
+        procs = {}
+        t0 = time.monotonic()
+        for tag, deck in entries:
+            (work / f"{tag}.cmd").write_text(deck)
+            out = open(work / f"{tag}.out", "wb"); err = open(work / f"{tag}.err", "wb")
+            procs[tag] = (subprocess.Popen(SDEVICE + [f"{tag}.cmd"], cwd=work, stdout=out, stderr=err), out, err)
+        winner, cur = None, None
+        pending = set(procs)
+        while pending and winner is None:
+            time.sleep(1.0)
+            for tag in list(pending):
+                proc = procs[tag][0]
+                if proc.poll() is None:
+                    if time.monotonic() - t0 > 7200: proc.kill(); pending.discard(tag)
+                    continue
+                pending.discard(tag)
+                if proc.returncode == 0 and (work / f"{tag}_des.plt").exists():
+                    try:
+                        c = abs(float(PLTFile(work / f"{tag}_des.plt").columns["d_total_current"][-1]))
+                        if math.isfinite(c):
+                            winner, cur = tag, c
+                            break
+                    except Exception:                      # noqa: broad-except
+                        pass
+        for tag, (proc, out, err) in procs.items():
+            if proc.poll() is None:
+                proc.kill(); proc.wait()
+            out.close(); err.close()
+        wall = time.monotonic() - t0
+        newton = 0
+        if winner:
+            txt = (work / f"{winner}.out").read_text(errors="replace")
+            newton = len(re.findall(r"^\s*(\d+)\s+[-\d.]+e[+-]\d+", txt, re.MULTILINE))
+        # cpu: both processes ran for (about) the wall time until the loser was killed
+        return cur, {"wall": wall, "cpu": wall * len(entries), "newton": newton, "returncode": 0 if winner else 1}, winner
+
     def _sdevice(self, tag: str, deck: str) -> tuple[float | None, dict]:
         work = self.run_dir / "twin"
         (work / f"{tag}.cmd").write_text(deck)
@@ -628,6 +672,9 @@ class Twin:
         nb = self._neighbour(vg, vd) if self.mode == "warm" and self.neighbour_ramp and fallbacks else None
         if nb is not None:
             recipes.append(("neighbour", nb[1], nb[2], neighbour_ramp(nb[0], vg, vd)))
+            if self.ramp_race:
+                recipes[-1] = ("neighbour", nb[1], nb[2], (neighbour_ramp(nb[0], vg, vd),
+                                                          neighbour_ramp(nb[0], vg, vd, *self.ramp_race)))
         if fallbacks and (self.mode != "warm" or self.cold_fallback or not recipes):
             recipes.append(("cold", 0.0, 0.0, cold_solve(vg, vd)))
         if not fallbacks:
@@ -644,6 +691,21 @@ class Twin:
                 self.write_guess(self.with_metal_state(nbf, vg, vd), f"g{tag}n", vg, vd)
                 solve = warm_solve(f"g{tag}n", self.warm_iterations)
                 recipes[i] = (name, ev_g, ev_d, solve)
+            if isinstance(solve, tuple):                      # raced ramps (default vs aggressive step sizes)
+                base_tag = f"{tag}{chr(97 + i)}"
+                entries = [(base_tag if k == 0 else f"{base_tag}r{k}", make_deck(self.base, base_tag if k == 0 else f"{base_tag}r{k}",
+                                                                                  ev_g, ev_d, sv, grid=GRID)) for k, sv in enumerate(solve)]
+                cur, t, won = self._sdevice_race(entries)
+                if won and won != base_tag:                   # keep the winner's plot under the recipe's tag
+                    work = self.run_dir / "twin"
+                    for ext in ("_des.tdr", "_des.plt"):
+                        if (work / f"{won}{ext}").exists():
+                            shutil.copy(work / f"{won}{ext}", work / f"{base_tag}{ext}")
+                total_wall += t["wall"]; total_cpu += t["cpu"]; newton += t["newton"]
+                if cur is not None:
+                    used = name
+                    break
+                continue
             if name == "escalated":
                 try:
                     fields, info2 = self.refine_fields(fields, vg, vd, solver=self.solver_escalate)
