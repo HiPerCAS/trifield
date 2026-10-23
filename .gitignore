@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+/runs/
+/checkpoints/
+/data/
+/out/
+tb_*/
+*.log
+# Sentaurus material parameters are proprietary and must not be committed
+parameter.par
+*.tdr
+*.grd
+*.dat
+# LaTeX build products of the architecture figure
+assets/*.aux
+assets/*.fdb_latexmk
+assets/*.fls
+assets/*.synctex.gz
+assets/architecture.pdf

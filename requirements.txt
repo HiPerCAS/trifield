@@ -1,0 +1,8 @@
+# Install PyTorch for your platform first (https://pytorch.org/get-started/),
+# then:  pip install -r requirements.txt
+torch>=2.2
+torch-geometric>=2.5
+numpy>=1.24
+matplotlib>=3.7
+scipy>=1.10
+tensorboard>=2.14

@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trifield"
+version = "1.0.0"
+description = "Mesh-native physics-informed graph surrogates for TCAD-in-the-loop design space exploration (ICCAD 2026)."
+readme = "README.md"
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Leonid Popryho" },
+  { name = "Ayoub Sadeghi" },
+  { name = "Inna Partin-Vaisband" },
+]
+keywords = ["TCAD", "graph neural network", "physics-informed", "surrogate model",
+            "drift-diffusion", "active learning", "design space exploration", "EDA", "GaN", "FinFET"]
+dependencies = [
+  "torch>=2.2",
+  "torch-geometric>=2.5",
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+examples = ["matplotlib>=3.7", "scipy>=1.10"]
+train = ["tensorboard>=2.14"]
+assets = ["matplotlib>=3.7", "pillow>=10"]
+# GPU physics refinement (CUDA 13): cuDSS through nvmath
+gpu = ["cupy-cuda13x>=14", "nvidia-cudss-cu13>=0.8", "nvmath-python[cu13]>=1.0"]
+# TCAD side: per-mesh exports and the TDR reader
+tcad = ["scipy>=1.10", "zstandard>=0.22"]
+
+[project.urls]
+Paper = "https://doi.org/10.1145/3831252.3834249"
+Repository = "https://github.com/HiPerCAS/trifield"
+
+[tool.setuptools]
+packages = ["trifield", "trifield.data", "trifield.tcad"]
+
+[tool.setuptools.package-data]
+"trifield.tcad" = ["templates/*.cmd", "README.md"]

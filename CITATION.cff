@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "TriField: Mesh-Native Physics-Informed Graph Surrogates for TCAD-in-the-Loop Design Space Exploration"
+authors:
+  - family-names: Popryho
+    given-names: Leonid
+    orcid: "https://orcid.org/0009-0002-0578-9592"
+  - family-names: Sadeghi
+    given-names: Ayoub
+    orcid: "https://orcid.org/0000-0001-9904-9813"
+  - family-names: Partin-Vaisband
+    given-names: Inna
+    orcid: "https://orcid.org/0000-0002-6399-6672"
+license: BSD-3-Clause
+repository-code: "https://github.com/HiPerCAS/trifield"
+preferred-citation:
+  type: conference-paper
+  title: "Mesh-Native Physics-Informed Graph Surrogates for TCAD-in-the-Loop Design Space Exploration"
+  authors:
+    - family-names: Popryho
+      given-names: Leonid
+    - family-names: Sadeghi
+      given-names: Ayoub
+    - family-names: Partin-Vaisband
+      given-names: Inna
+  collection-title: "Proceedings of the IEEE/ACM International Conference on Computer-Aided Design (ICCAD)"
+  year: 2026
+  doi: "10.1145/3831252.3834249"
+  publisher:
+    name: "ACM"
