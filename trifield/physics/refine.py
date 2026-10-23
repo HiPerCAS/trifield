@@ -165,12 +165,12 @@ class Solver:
         hist = []
         for it in range(cfg.gummel_iters if iters is None else iters):
             psi, mp = self.poisson_newton(psi, phin, phip, cfg.poisson_maxit)
-            r, c, v, nfull = eq.electron_sg_operator(psi, phin)
+            r, c, v, nfull = eq.electron_sg_operator(psi, phin, phip)
             A = bk.coo(r, c, v, (self.n, self.n))
             act, fix = self._split(V, nfull, Dn)
             Pa, Pf = self._sel(act), self._sel(fix)
             s = nfull[act]
-            rhs = -((Pa @ A @ Pf.T) @ bk.arr(nfull[fix]))
+            rhs = -((Pa @ A @ Pf.T) @ bk.arr(nfull[fix])) - bk.arr(eq.last_sg_b[act])
             y = bk.tens(bk.solve((Pa @ A @ Pa.T) @ bk.sp.diags(bk.arr(s)), rhs, key="sg")).to(DT)
             if not bool(torch.isfinite(y).all()):
                 break
@@ -190,11 +190,11 @@ class Solver:
         if jac:
             sc, dps, dpf = self.charge_derivs(psi, phin, phip)
             Fp = torch.sparse.mm(self.Kt, psi[:, None])[:, 0] + eq.qM * sc
-            r, m, rows, cols, vp, vf = eq.electron_jacobian(psi, phin)
+            r, m, rows, cols, vp, vf = eq.electron_jacobian(psi, phin, phip)
             return dict(Fp=Fp, dps=dps, dpf=dpf, Fc=r, mc=m, rows=rows, cols=cols, vp=vp, vf=vf)
         with torch.no_grad():
             Fp = self.poisson_res(psi, phin, phip)
-            r, m = eq.electron(psi, phin)
+            r, m = eq.electron(psi, phin, phip)
         return dict(Fp=Fp, Fc=r, mc=m)
 
     def joint_newton(self, psi, phin, phip, bounds, maxit=None, stall_check=False):

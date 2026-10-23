@@ -111,12 +111,51 @@ class Equations:
             mag[a] = mag[a] + f.abs(); mag[b] = mag[b] + f.abs()
         return torch.stack(res, 1), torch.stack(mag, 1)
 
-    def electron(self, psi, phin):
+    # SRH + interface-trap net recombination, shared by both carriers. Negligible against on-state fluxes, but in
+    # deep depletion (n < ~1e-10 cm^-3) generation balances the vanishing drift and sets Phi_n: without it the
+    # depleted-region Phi_n of a Sentaurus solution violates the electron balance by O(1) (median 0.1 relative)
+    electron_recombination = True
+
+    def recombination(self, psi, phin, phip):
+        """Net rate R [cm^-3 s^-1] per vertex (0 outside the semiconductor)."""
+        Ec, Ev, n, p, gn, gp = self.bands(psi, phin, phip)
+        nie2 = self.Nc * self.Nv * torch.exp(-self.Eg / KT); nie = torch.sqrt(nie2)
+        tau = self.md.physics.tau
+        R = (n * p - gn * gp * nie2) / (tau * (n + gn * nie) + tau * (p + gp * nie))
+        for idx, conc, emid, cc, K in self.traps:
+            Et = (Ec[idx] + Ev[idx]) / 2 + KT / 2 * torch.log(self.Nv[idx] / self.Nc[idx]) + emid
+            n1 = gn[idx] * self.Nc[idx] * torch.exp((Et - Ec[idx]) / KT)
+            p1 = gp[idx] * self.Nv[idx] * torch.exp((Ev[idx] - Et) / KT)
+            R = R.index_add(0, idx, K * conc * cc * (n[idx] * p[idx] - n1 * p1) / (n[idx] + n1 + p[idx] + p1))
+        return torch.where(self.semi, R, torch.zeros_like(R))
+
+    def electron_recombination_linear(self, psi, phin, phip):
+        """R = a n - b with lagged denominators (for the linear SG electron solve)."""
+        Ec, Ev, n, p, gn, gp = self.bands(psi, phin, phip)
+        nie2 = self.Nc * self.Nv * torch.exp(-self.Eg / KT); nie = torch.sqrt(nie2)
+        tau = self.md.physics.tau
+        den = tau * (n + gn * nie) + tau * (p + gp * nie)
+        a = p / den; b = gn * gp * nie2 / den
+        for idx, conc, emid, cc, K in self.traps:
+            Et = (Ec[idx] + Ev[idx]) / 2 + KT / 2 * torch.log(self.Nv[idx] / self.Nc[idx]) + emid
+            n1 = gn[idx] * self.Nc[idx] * torch.exp((Et - Ec[idx]) / KT)
+            p1 = gp[idx] * self.Nv[idx] * torch.exp((Ev[idx] - Et) / KT)
+            d2 = n[idx] + n1 + p[idx] + p1
+            a = a.index_add(0, idx, K * conc * cc * p[idx] / d2)
+            b = b.index_add(0, idx, K * conc * cc * n1 * p1 / d2)
+        z = torch.zeros_like(a)
+        return torch.where(self.semi, a, z), torch.where(self.semi, b, z)
+
+    def electron(self, psi, phin, phip=None):
         er, em = self.electron_elem(psi[self.Ts], phin[self.Ts])
         z = torch.zeros(self.n, dtype=DT, device=self.dev)
-        return z.index_add(0, self.Ts.reshape(-1), er.reshape(-1)), z.index_add(0, self.Ts.reshape(-1), em.reshape(-1))
+        r = z.index_add(0, self.Ts.reshape(-1), er.reshape(-1)); m = z.index_add(0, self.Ts.reshape(-1), em.reshape(-1))
+        if phip is not None and self.electron_recombination:
+            RV = self.Msemi * self.recombination(psi, phin, phip)
+            r = r - RV; m = m + RV.abs()
+        return r, m
 
-    def electron_jacobian(self, psi, phin):
+    def electron_jacobian(self, psi, phin, phip=None):
         """Residual, magnitude and sparse (torch COO -> returned as numpy triplets) d r / d psi, d r / d Phi_n."""
         P = psi[self.Ts].detach().clone().requires_grad_(True)
         F = phin[self.Ts].detach().clone().requires_grad_(True)
@@ -129,9 +168,16 @@ class Equations:
         z = torch.zeros(self.n, dtype=DT, device=self.dev)
         r = z.index_add(0, self.Ts.reshape(-1), er.detach().reshape(-1))
         m = z.index_add(0, self.Ts.reshape(-1), em.detach().reshape(-1))
+        if phip is not None and self.electron_recombination:
+            Pv = psi.detach().clone().requires_grad_(True); Fv = phin.detach().clone().requires_grad_(True)
+            RV = self.Msemi * self.recombination(Pv, Fv, phip.detach())
+            gp_, gf_ = torch.autograd.grad(RV.sum(), (Pv, Fv))
+            r = r - RV.detach(); m = m + RV.detach().abs()
+            diag = torch.arange(self.n, device=self.dev)
+            rows.append(diag); cols.append(diag); vp.append(-gp_); vf.append(-gf_)
         return r, m, torch.cat(rows), torch.cat(cols), torch.cat(vp), torch.cat(vf)
 
-    def electron_sg_operator(self, psi, phin):
+    def electron_sg_operator(self, psi, phin, phip=None):
         """Linear SG operator A (inflow = A n) with w and mobility frozen; returns triplets and n."""
         with torch.no_grad():
             P, F = psi[self.Ts], phin[self.Ts]
@@ -147,6 +193,13 @@ class Equations:
                 rows += [ia, ia, ib, ib]; cols += [ia, ib, ia, ib]; vals += [-c * Bm, c * Bp, c * Bm, -c * Bp]
             n_full = torch.zeros(self.n, dtype=DT, device=self.dev)
             n_full[self.Ts.reshape(-1)] = (self.Nc[self.Ts] * r).reshape(-1)
+            bvec = torch.zeros(self.n, dtype=DT, device=self.dev)
+            if phip is not None and self.electron_recombination:
+                a, b = self.electron_recombination_linear(psi, phin, phip)      # inflow - M (a n - b) = 0
+                diag = torch.arange(self.n, device=self.dev)
+                rows.append(diag); cols.append(diag); vals.append(-self.Msemi * a)
+                bvec = self.Msemi * b
+        self.last_sg_b = bvec
         return torch.cat(rows), torch.cat(cols), torch.cat(vals), n_full
 
     # -------------------------------------------------------------- holes (linear in p, lagged)
