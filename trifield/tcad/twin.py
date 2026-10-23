@@ -228,6 +228,14 @@ def warm_solve(prefix: str, iterations: int = 40) -> str:
     return f'\tLoad(FilePrefix= "{prefix}")\n\tCoupled(Iterations= {iterations}){{ Poisson Electron Hole }}'
 
 
+def warm_two_stage(prefix: str, iterations: int = 40) -> str:
+    """Newton on (psi, n) with the guess's holes held, then on the full system (deep off-state, see
+    `Twin.hole_stage`): the hole inversion layer under the gate re-forms in the second stage."""
+    return (f'\tLoad(FilePrefix= "{prefix}")\n'
+            f"\tCoupled(Iterations= {iterations}){{ Poisson Electron }}\n"
+            f"\tCoupled(Iterations= {iterations}){{ Poisson Electron Hole }}")
+
+
 def warm_poisson_first(prefix: str, iterations: int = 80) -> str:
     """Hold the predicted quasi-Fermi levels, make psi consistent with them (nonlinear
     Poisson, robust), then damped Newton on the full system."""
@@ -279,7 +287,8 @@ class Twin:
                  anchor_before_refine: bool = False, refine_config=None, feature_version: int | None = None,
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
                  metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
-                 trap_calibration: bool = True, ramp_race: tuple | None = None):
+                 trap_calibration: bool = True, ramp_race: tuple | None = None, nbguess_dv: float = 0.6,
+                 hole_stage: bool = False):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -307,6 +316,16 @@ class Twin:
         self.neighbour_ramp = neighbour_ramp
         # race the default neighbour ramp against one with these (InitialStep, MaxStep); None = default only
         self.ramp_race = ramp_race
+        # largest gate step for which the nearest converged solution is tried as a direct guess (nbguess)
+        self.nbguess_dv = nbguess_dv
+        # deep off-state (normally-on designs at Vd > 0 and Vg <~ -3 V): holes invert at the GaN/HfO2 interface
+        # under the gate. The layer exchanges carriers only through regions with p ~ 1e-11 cm^-3, so its level is
+        # close to undetermined: a neighbour solution carries the neighbour's level and the single-stage Newton
+        # often diverges on it. hole_stage (Vg < 0 < Vd) races the nbguess solve against two two-stage solves
+        # (Newton on (psi, n) with the holes held, then the full system, where the layer settles): from the
+        # neighbour as is, and with its holes stripped (Phi_p = Phi_n, the layer re-forms from p ~ 0). 1 V
+        # neighbour steps at -3..-6 V on three normally-on designs converge 4/12 single-stage, 10/12 raced.
+        self.hole_stage = hole_stage
         # write the contact-metal Fermi-potential drop into every guess (needs the physics export)
         self.metal_state = metal_state
         # Vth search: "legacy" brackets at 0/-2/-4/-6 V (the -2 V point is a deep off-state warm start: neighbour
@@ -685,13 +704,19 @@ class Twin:
         cur, total_wall, total_cpu, newton, used = None, 0.0, 0.0, 0, None
         for i, (name, ev_g, ev_d, solve) in enumerate(recipes):
             if name == "nbguess":
-                nbf = self._neighbour_fields(vg, vd, max_dv=0.6)
+                nbf = self._neighbour_fields(vg, vd, max_dv=self.nbguess_dv)
                 if nbf is None:
                     continue
                 self.write_guess(self.with_metal_state(nbf, vg, vd), f"g{tag}n", vg, vd)
                 solve = warm_solve(f"g{tag}n", self.warm_iterations)
+                if self.hole_stage and vg < 0 < vd:
+                    semi = self.solver.md.semi
+                    strip = {**nbf, FIELD_FUNCS[2]: np.where(semi, nbf[FIELD_FUNCS[1]], nbf[FIELD_FUNCS[2]])}
+                    self.write_guess(self.with_metal_state(strip, vg, vd), f"g{tag}h", vg, vd)
+                    solve = (solve, warm_two_stage(f"g{tag}n", self.warm_iterations),
+                             warm_two_stage(f"g{tag}h", self.warm_iterations))
                 recipes[i] = (name, ev_g, ev_d, solve)
-            if isinstance(solve, tuple):                      # raced ramps (default vs aggressive step sizes)
+            if isinstance(solve, tuple):                      # raced decks: ramp step sizes, or one- vs two-stage nbguess
                 base_tag = f"{tag}{chr(97 + i)}"
                 entries = [(base_tag if k == 0 else f"{base_tag}r{k}", make_deck(self.base, base_tag if k == 0 else f"{base_tag}r{k}",
                                                                                   ev_g, ev_d, sv, grid=GRID)) for k, sv in enumerate(solve)]
