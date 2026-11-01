@@ -10,8 +10,8 @@ Electrons (1/s): r_i = sum_T sum_edges mu_T V_T kappa_ab [n_a B(-d) - n_b B(d)] 
                 mu_T = measure-weighted mean over the element's vertices of Caughey-Thomas(mu_low,v, F_T),
                 F_T = |grad Phi_n| (|grad psi| in elements touching a contact sheet)
 Holes:          mirror image with w_p = psi + chi + E_g - V_T ln gamma_p, R = SRH + interface-trap capture.
-Recombination is negligible for electrons (R <~ 1e2 cm^-3 s^-1) and kept only in the hole equation, where
-it sets Phi_p (p ~ 1e-50).
+R (SRH + interface-trap capture) is in both carrier equations: negligible against on-state electron fluxes,
+but in deep depletion generation sets Phi_n, and it sets Phi_p everywhere (p ~ 1e-50).
 """
 from __future__ import annotations
 
@@ -106,14 +106,14 @@ class Equations:
         return (mu * self.Ms).sum(1) / torch.clamp(self.Ms.sum(1), min=1e-300)
 
     # -------------------------------------------------------------- electron continuity (element-local)
-    def electron_elem(self, P, F):
+    def electron_elem(self, P, F, lag=None):
         chi = self.chi[self.Ts]; Nc = self.Nc[self.Ts]
         eta = (-F - (self.C0 - chi - P)) / KT
         r = r_of_eta_t(eta)
         n = Nc * r
         w = P + chi + KT * (torch.log(r) - eta)
         mu = self.mobility_e(P, F)
-        if self.lag_mobility:
+        if self.lag_mobility if lag is None else lag:
             mu = mu.detach()              # Jacobian without d mu / d (driving force): the residual is unchanged
         res = [torch.zeros_like(P[:, 0]) for _ in range(4)]; mag = [torch.zeros_like(P[:, 0]) for _ in range(4)]
         for k, (a, b) in enumerate(EDGES):
@@ -177,11 +177,11 @@ class Equations:
             r = r - RV; m = m + RV.abs()
         return r, m
 
-    def electron_jacobian(self, psi, phin, phip=None):
+    def electron_jacobian(self, psi, phin, phip=None, lag=None):
         """Residual, magnitude and sparse (torch COO -> returned as numpy triplets) d r / d psi, d r / d Phi_n."""
         P = psi[self.Ts].detach().clone().requires_grad_(True)
         F = phin[self.Ts].detach().clone().requires_grad_(True)
-        er, em = self.electron_elem(P, F)
+        er, em = self.electron_elem(P, F, lag)
         rows, cols, vp, vf = [], [], [], []
         for i in range(4):
             gp, gf = torch.autograd.grad(er[:, i].sum(), (P, F), retain_graph=True)

@@ -207,12 +207,12 @@ class Solver:
                 break
         return psi, phin, hist
 
-    def _eval(self, psi, phin, phip, jac):
+    def _eval(self, psi, phin, phip, jac, lag=None):
         eq = self.eq
         if jac:
             sc, dps, dpf = self.charge_derivs(psi, phin, phip)
             Fp = torch.sparse.mm(self.Kt, psi[:, None])[:, 0] + eq.qM * sc
-            r, m, rows, cols, vp, vf = eq.electron_jacobian(psi, phin, phip)
+            r, m, rows, cols, vp, vf = eq.electron_jacobian(psi, phin, phip, lag)
             return dict(Fp=Fp, dps=dps, dpf=dpf, Fc=r, mc=m, rows=rows, cols=cols, vp=vp, vf=vf)
         with torch.no_grad():
             Fp = self.poisson_res(psi, phin, phip)
@@ -265,17 +265,18 @@ class Solver:
                     float(torch.sqrt((b ** 2).mean())))
         hist = []; good = (psi.clone(), phin.clone()); delta = cfg.ptc; best = None
         mj = cfg.mobility_jacobian
-        exact_failed = False
+        exact_failed, lag = False, None             # lag: None = Equations.lag_mobility (thread safe: no shared state)
+        prev = None                                 # (lag, merit, accepted trial merit) of the previous iteration
         for it in range(maxit + 1):
             frz = self._frozen(psi, phin, phip)
             keep = None if frz is None else ~frz
             if mj in ("exact", "lagged"):
-                eq.lag_mobility = mj == "lagged"
+                lag = mj == "lagged"
             elif mj == "hybrid":
-                if hist and not eq.lag_mobility and hist[-1][0] > 0.5 * hist[-2][0]:
+                if prev is not None and prev[0] is False and prev[2] > 0.5 * prev[1]:
                     exact_failed = True                 # the exact model did not pay off: lagged from here on
-                eq.lag_mobility = exact_failed or not hist or hist[-1][0] > cfg.hybrid_switch
-            o = self._eval(psi, phin, phip, True)
+                lag = exact_failed or prev is None or prev[2] > cfg.hybrid_switch
+            o = self._eval(psi, phin, phip, True, lag)
             cs = torch.clamp(o["mc"][V], min=1e-30 + cfg.cont_floor * float(o["mc"][V].median()))
             m, mp, mc = merit(o, cs, keep)
             if not np.isfinite(m):
@@ -327,6 +328,7 @@ class Solver:
                                             n_at_dphi=float(nn[self.V[iv]]), frozen=0 if frz is None else int(frz.sum()),
                                             lin_res=lin_res))
             psi, phin = tp, tf
+            prev = (lag, m, mt)
             if smax * lam < 1e-12: break
         if best is not None and best[0][0] < hist[-1][0]:
             psi, phin = best[1], best[2]

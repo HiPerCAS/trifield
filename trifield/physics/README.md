@@ -17,7 +17,7 @@ The twin (`trifield.tcad.twin.Twin(refine=True)`) uses refinement by default.
 | space charge | p - n + N_D - N_A + interface-trap charge. Donor traps use steady-state SRH with Fermi gamma factors, E_t = E_i + E_mid. The volume density is sigma * A_interface / V_box. |
 | electron flux | Scharfetter-Gummel with Fermi correction: w = psi + chi + V_T ln gamma_n. |
 | mobility | Element-averaged (measure weights) Caughey-Thomas, beta 0.9, vsat 2.6e7. Driving force is \|grad Phi_n\| per element, or \|grad psi\| in elements touching a contact sheet. **The doping dependence is inactive in this deck**: Sentaurus sees N = 0 because Donor/AcceptorConcentration are not set, so mu_low = mumax(x) - mumin2. |
-| holes | Mirror image of electrons (mu_p 20 / 116 / 150, beta 0.8). Recombination is SRH (tau = 1e-9) plus interface-trap capture: K Conc vth sigma (np - n1 p1)/(n + n1 + p + p1), with vth = 1.5626e7 cm/s. Holes carry no charge of consequence (p about 1e-50), but they set Phi_p. |
+| holes | Mirror image of electrons (mu_p 20 / 116 / 150, beta 0.8). Recombination is SRH (tau = 1e-9) plus interface-trap capture: K Conc vth sigma (np - n1 p1)/(n + n1 + p + p1), with vth = 1.5626e7 cm/s, in both carrier equations (in deep depletion generation sets Phi_n). Holes carry no charge of consequence (p about 1e-50) except in the inversion layer under a strongly negative gate, but they set Phi_p. |
 | boundary | Gate (TiN) psi = Vg + 0.846115. Gold bulk psi = V + 0.506115. Gold/semiconductor vertices: charge neutrality with Phi = V. Gold/AlGaN(x=0) vertices: psi - Phi_n = -0.140375. All of these constants are taken from the per-mesh equilibrium export. |
 
 Residual levels on the true solutions, median relative:
@@ -50,13 +50,44 @@ Python >= 3.14, or the `zstd` CLI.
 ## Refinement (`Solver(md, device).refine(guess, vg, vd)`)
 
 1. Apply the boundary rules.
-2. Damped Gummel: Poisson Newton with Phi frozen, then a linear SG solve for n. Phi_n steps are
-   capped at 0.05 V and relaxed by 0.5, and Phi_n is clipped to [min(0, Vd), max(0, Vd)] +- 0.05 V
-   (the maximum principle).
-3. Joint (psi, Phi_n) Newton with a row-scaled merit and backtracking. If the merit falls by less
-   than 30% over 6 iterations, run 10 more Gummel sweeps and restart (up to 8 restarts, 120 Newton
-   iterations in total).
-4. Solve for Phi_p from the linear hole continuity.
+2. Vd = 0 (every contact grounded, the gate insulated): no current flows, so Phi_n = Phi_p = 0 exactly and
+   only the nonlinear Poisson equation is solved (`equilibrium_vd0`; merit ~1e-14 in ~2 s).
+3. Damped Gummel: Poisson Newton with Phi frozen, then a linear SG solve for n (with generation). Phi_n steps
+   are capped at 0.05 V and relaxed by 0.5, and Phi_n is clipped to [min(0, Vd, Vg), max(0, Vd)] +- 0.05 V
+   (the maximum principle; the gate term matters at deep off-state, where depleted Phi_n follows the hole level
+   down to ~-2 V).
+4. Joint (psi, Phi_n) Newton with backtracking on a row-scaled merit. Details that make it converge where it
+   used to stall:
+   - continuity rows are scaled by the one-directional (gross) SG flows, not by the net flows: next to the
+     AlGaN/GaN barriers large opposite flows nearly cancel, and net-scaled rows changed by 1e3 x their scale for
+     a 1e-4 V step (`Equations.gross_scale`);
+   - carrier-free vertices (n < 1e-2 cm^-3; interface-trap vertices only below 1e-3 n1, where their occupancy
+     saturates) are held fixed as unit rows: their Phi_n components reach 10-1e5 V and used to throttle every
+     step through the clip. Afterwards their Phi_n is filled from the linear SG balance with generation;
+   - the Jacobian ignores d mu / d (driving force) while the merit is above 1e-4 (Caughey-Thomas with
+     beta = 0.9 has a cusp at zero driving force, which stalls the line search at near-equilibrium vertices),
+     then switches to the exact Jacobian for a quadratic finish (`mobility_jacobian="hybrid"`);
+   - the best iterate is kept. If the merit falls by less than 30% over 6 iterations, 10 more Gummel sweeps
+     run and Newton restarts.
+5. Phi_p from the linear hole continuity; on carrier-free vertices (n < 1e-10) Phi_p = Phi_n - 0.25 V
+   (`hole_tie`, also used during the solve), because the lagged linear hole solve collapses a hole inversion
+   layer (deep off-state) to p ~ 0 while psi was solved with one.
+6. A final nonlinear Poisson solve makes psi consistent with the quasi-Fermi levels written.
+
+`RefineConfig(trace=True)` records per-iteration Newton diagnostics (merit parts, damping, step sizes,
+frozen count, linear-solve residual) in `RefineResult.extra["trace"]`.
+
+## Interface-trap calibration (`Twin.calibrate_traps`, `export.trap_factors`)
+
+Our trap density per vertex (sigma * A_interface / V_box) is Sentaurus' except at convex corners of the top
+AlGaN layer under the gate, where Sentaurus' AlGaN/HfO2 trap density is 1.6 to ~30 x ours (bias independent;
+not explained by interface-area rules, multiplicity, region or box volumes). The twin measures it once per
+design: a state with every donor trap ionised (Phi_n = +20 V, Phi_p = -20 V in the semiconductor) is loaded
+and plotted after `Coupled(Iterations= 0)` with `RHSMin= 1e30` (without it Sentaurus moves the state), and
+NetTrappedCharge / ours gives a factor per vertex (one ~9 s sdevice run, cached in
+`work/physics/trap_factors.pkl`, applied with `Solver.set_trap_factors`). The factors equal those derived from
+converged deep off-state Sentaurus solutions to 1e-4, and with them those solutions satisfy our Poisson
+equation at the on-state floor (rms 5e-2 -> 5e-4).
 
 `Solver.terminal_currents` gives the electrode currents from the SG fluxes. In the deck's .plt units
 they agree with Sentaurus to about 5e-4 relative on true solutions.
@@ -93,15 +124,13 @@ Phi_n / Phi_p there as 0 placeholders) when the guess' current is trustworthy.
 
 ## Known floors and caveats
 
-- **Deep off-state (Vg <= -2 V at Vd = 12 V, normally-on designs).** Two differences remain. (1) At a few
-  AlGaN/HfO2 trap vertices of the top AlGaN layer, Sentaurus' trapped charge is a fixed per-vertex factor
-  1.6-2.8 larger than this model's (bias-independent; not the interface-area rule, interface multiplicity,
-  region or box volumes); calibrated from one deep off-state solution, the true solutions' Poisson residual
-  falls to the on-state floor (~1.4e-4) at every bias. (2) In fully depleted regions (n ~ 1e-20 cm^-3) the
-  scaled electron-continuity rows are degenerate and Newton stalls at a merit of ~3e-2, even from
-  Sentaurus' own neighbouring solution. Refined guesses there are outside Sentaurus' basin; the twin falls
-  back to a ramp from its nearest converged point. A depletion-aware formulation (Slotboom variables or
-  masking rows with negligible density) is the next step.
+- **Deep off-state (Vg <= -2 V at Vd = 12 V, normally-on designs).** With electron generation, calibrated
+  traps and frozen carrier-free vertices the refinement converges there and Sentaurus' solutions satisfy our
+  equations (Poisson at the floor, continuity 5e-11). What remains is the hole inversion layer at the GaN/HfO2
+  interface under the gate (Vg <~ -4 V): its level is floating (it exchanges holes only with p ~ 1e-11
+  neighbours, below Sentaurus' error reference), our linear hole solve is singular there, and the 0.25 V
+  tie is a heuristic (Sentaurus' states sit at Phi_p - Phi_n ~ -0.25..-0.37 V and accept a layer charge within
+  ~1 decade). Some of these points still need many Sentaurus iterations or fail.
 
 - **AlGaN/GaN heterointerface.** The deck has no double points, so each heterointerface vertex gets
   one parameter set. Sentaurus uses AlGaN(x of the vertex), and x = 0 there gives chi 3.958 / Eg 3.435
