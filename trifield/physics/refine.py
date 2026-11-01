@@ -328,6 +328,12 @@ class Solver:
             rp = self.bk.tens(A @ self.bk.arr(p)).to(DT)
         return Q * (rn.cpu().numpy() - rp.cpu().numpy())
 
+    def set_trap_factors(self, factors):
+        """Per-vertex interface-trap factors (one array per trap set of md.traps, None = 1); see
+        trifield.physics.export.trap_factors. Applies to space charge and trap recombination."""
+        self.md.trap_factors = factors
+        self.eq.set_traps(factors)
+
     def metal_drop(self, psi, phin, phip):
         """Fermi-potential drop (phi_metal - V_contact) [V] at every contact-metal vertex, from the current the
         given fields carry into each contact: current conservation in the metal (box Laplacian over metal

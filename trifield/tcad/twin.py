@@ -278,7 +278,8 @@ class Twin:
                  gate_uncertainty: float | None = None, refine: bool = True, refine_device: str = "cpu",
                  anchor_before_refine: bool = False, refine_config=None, feature_version: int | None = None,
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
-                 metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000):
+                 metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
+                 trap_calibration: bool = True):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -315,6 +316,8 @@ class Twin:
         # refine_device="auto": SuperLU on the CPU for small meshes (cuDSS is overhead-bound there: 14 s vs ~11-106 s
         # at 3k nodes), cuDSS on the GPU above `refine_cpu_below` vertices (17x faster at 25k nodes)
         self.refine_cpu_below = refine_cpu_below
+        # per-vertex interface-trap density from one 0-iteration Sentaurus plot (calibrate_traps)
+        self.trap_calibration = trap_calibration
         self._md = None
         self.solver_escalate = None
         self.solver = None
@@ -389,6 +392,45 @@ class Twin:
         self.timing["prepare"] = time.monotonic() - t0
         if physics is not None:
             physics.join()
+            if self.trap_calibration:
+                self.calibrate_traps()
+
+    def calibrate_traps(self) -> None:
+        """Sentaurus' per-vertex interface-trap density from one 0-iteration plot of a state with every donor trap
+        ionised (Phi_n = +20 V, Phi_p = -20 V in the semiconductor); cached in work/physics/trap_factors.pkl and applied
+        to the refinement solvers (trifield.physics.export.trap_factors). Without it the refined psi is up to ~1 V off
+        Sentaurus' at a few AlGaN/HfO2 corner vertices under the gate, where Sentaurus' first Newton steps then go astray."""
+        if self.solver is None or self.template_dat is None:
+            return
+        import pickle
+        from trifield.physics.export import trap_factors
+        t0 = time.monotonic()
+        work = self.run_dir / "twin"
+        cache = work / "physics" / "trap_factors.pkl"
+        md = self.solver.md
+        try:
+            if cache.exists():
+                factors = pickle.loads(cache.read_bytes())
+            else:
+                psi = np.zeros(md.n)
+                phin = np.where(md.semi, 20.0, 0.0); phip = np.where(md.semi, -20.0, 0.0)
+                self.write_guess(dict(zip(FIELD_FUNCS, (psi, phin, phip))), "gtrapcal", 0.0, 0.0)
+                solve = ('\tLoad(FilePrefix= "gtrapcal")\n\tCoupled(Iterations= 0){ Poisson Electron Hole }\n'
+                         '\tPlot(FilePrefix= "trapcalp")')
+                self._sdevice("trapcal", make_deck(self.base, "trapcal", 0.0, 0.0, solve, grid=GRID,
+                                                   math_extra="RHSMin= 1e30"))
+                plot = next(iter(sorted(work.glob("trapcalp*_des.tdr"))), None)
+                if plot is None:
+                    raise RuntimeError("no calibration plot")
+                factors = trap_factors(md, plot, work)
+                cache.write_bytes(pickle.dumps(factors))
+        except Exception as exc:                                          # noqa: broad-except
+            log.warning("trap calibration failed (%s); using the geometric trap density", exc)
+            return
+        for s in (self.solver, self.solver_escalate):
+            if s is not None:
+                s.set_trap_factors(factors)
+        self.timing["trap_calibration"] = time.monotonic() - t0
 
     def prepare_physics(self) -> None:
         """Per-mesh exports for the physics refinement (box data + equilibrium constants; cached in

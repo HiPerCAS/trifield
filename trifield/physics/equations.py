@@ -49,10 +49,20 @@ class Equations:
         self.MLn = t(md.mu_low_n[sem]); self.MLp = t(md.mu_low_p[sem])
         ph = md.physics
         self.bn, self.bp, self.vs = ph.beta_n, ph.beta_p, ph.vsat
-        self.traps = [(torch.as_tensor(i, device=self.dev), c, e, cc, t(K)) for i, c, e, cc, K in md.traps]
+        self.set_traps(getattr(md, "trap_factors", None))
         self.qM = t(md.qM)
         self.pdiag = t(md.pdiag)
         self.Msemi = t(md.Msemi * 1e-12)                 # cm^3 (recombination sink)
+
+    def set_traps(self, factors=None):
+        """Interface traps as (vertices, conc, E_mid, capture, K) with K = A_interface / V_box [cm^-1], times an optional
+        per-vertex factor per trap set (Sentaurus' trap density / ours, see trifield.physics.export.trap_factors)."""
+        md = self.md
+        t = lambda a: torch.as_tensor(np.asarray(a), dtype=DT, device=self.dev)
+        self.traps = []
+        for k, (i, c, e, cc, K) in enumerate(md.traps):
+            f = None if factors is None or factors[k] is None else np.asarray(factors[k], float)
+            self.traps.append((torch.as_tensor(i, device=self.dev), c, e, cc, t(K if f is None else K * f)))
 
     # -------------------------------------------------------------- densities and charge
     def bands(self, psi, phin, phip):
