@@ -113,18 +113,30 @@ class Equations:
         n = Nc * r
         w = P + chi + KT * (torch.log(r) - eta)
         mu = self.mobility_e(P, F)
+        if self.lag_mobility:
+            mu = mu.detach()              # Jacobian without d mu / d (driving force): the residual is unchanged
         res = [torch.zeros_like(P[:, 0]) for _ in range(4)]; mag = [torch.zeros_like(P[:, 0]) for _ in range(4)]
         for k, (a, b) in enumerate(EDGES):
             d = (w[:, b] - w[:, a]) / KT
-            f = mu * KT * self.Cs[:, k] * 1e-4 * (n[:, a] * bern(-d) - n[:, b] * bern(d))     # particles/s
+            c = mu * KT * self.Cs[:, k] * 1e-4
+            fa, fb = n[:, a] * bern(-d), n[:, b] * bern(d)
+            f = c * (fa - fb)                                                                 # particles/s
             res[a] = res[a] - f; res[b] = res[b] + f
-            mag[a] = mag[a] + f.abs(); mag[b] = mag[b] + f.abs()
+            g = (c.abs() * (fa + fb)).detach() if self.gross_scale else f.abs()
+            mag[a] = mag[a] + g; mag[b] = mag[b] + g
         return torch.stack(res, 1), torch.stack(mag, 1)
 
     # SRH + interface-trap net recombination, shared by both carriers. Negligible against on-state fluxes, but in
     # deep depletion (n < ~1e-10 cm^-3) generation balances the vanishing drift and sets Phi_n: without it the
     # depleted-region Phi_n of a Sentaurus solution violates the electron balance by O(1) (median 0.1 relative)
     electron_recombination = True
+    # continuity row scale: sum of |net| edge flows (False) or of the one-directional (gross) SG flows (True). Next
+    # to barriers (AlGaN/GaN, depleted buffer) large opposite flows nearly cancel: net-scaled rows are then stiff (a
+    # 1e-4 V perturbation can change them by 1e3 x their scale) and numerically meaningless beyond ~1e-16 G/g
+    gross_scale = True
+    # Caughey-Thomas with beta < 1 has a cusp at zero driving force (d mu / d F ~ F^(beta-1)): near-equilibrium vertices
+    # (heterointerface next to the 2DEG) then get a poor Newton model. True: Jacobian with the mobility frozen
+    lag_mobility = False
 
     def recombination(self, psi, phin, phip):
         """Net rate R [cm^-3 s^-1] per vertex (0 outside the semiconductor)."""

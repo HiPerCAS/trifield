@@ -39,6 +39,27 @@ class RefineConfig:
     restarts: int = 8                # joint-Newton stalls -> extra Gummel sweeps, then Newton again
     restart_gummel: int = 10
     stall_window: int = 6            # Newton iterations without a 30% merit reduction = stall
+    trace: bool = False              # per-iteration Newton diagnostics in RefineResult.extra["trace"]
+    lam_min: float = 1e-4            # line search: smallest damping factor tried
+    keep_best: bool = True           # return the iterate with the lowest merit, not the last one
+    # carrier-free vertices (n < freeze_n [cm^-3]; trap vertices below 1e-3 n1) are held fixed in the joint Newton
+    # (unit rows) and their Phi_n is filled afterwards from the linear SG balance incl. generation (fill_frozen); 0 = off
+    freeze_n: float = 1e-2
+    final_poisson: bool = True       # after the hole solve: nonlinear Poisson with the output Phi_n / Phi_p
+    # electron Jacobian: "exact" (incl. d mu / d driving force), "lagged" (mobility frozen: the Caughey-Thomas cusp at
+    # zero driving force, beta < 1, otherwise stalls the line search at near-equilibrium vertices), "hybrid" (lagged
+    # while the merit > hybrid_switch, then exact), "default" (Equations.lag_mobility)
+    mobility_jacobian: str = "hybrid"
+    hybrid_switch: float = 1e-4
+    # Phi_n bounds: [min(0, Vd) - margin, max(0, Vd) + margin] (maximum principle without generation); with
+    # gate_bounds the lower bound extends to Vg < 0 (deep off-state: depleted Phi_n follows the hole level to ~-2 V)
+    gate_bounds: bool = True
+    # Vd = 0: equilibrium (no current: Phi_n = Phi_p = 0 exactly), only the nonlinear Poisson equation is solved
+    equilibrium_vd0: bool = True
+    # carrier-free vertices: tie Phi_p = Phi_n + hole_tie (Sentaurus' deep off-state states sit at -0.25..-0.37 V)
+    # instead of the lagged linear hole solve, which is singular under a hole inversion layer; None = off
+    hole_tie: float | None = -0.25
+    hole_tie_nmax: float = 1e-10
 
 
 @dataclass
@@ -53,6 +74,7 @@ class RefineResult:
     poisson_rms: float
     continuity_rms: float
     time: dict = field(default_factory=dict)
+    extra: dict = field(default_factory=dict)
 
     def fields(self):
         return {"ElectrostaticPotential": self.psi, "eQuasiFermiPotential": self.phin, "hQuasiFermiPotential": self.phip}
@@ -197,23 +219,70 @@ class Solver:
             r, m = eq.electron(psi, phin, phip)
         return dict(Fp=Fp, Fc=r, mc=m)
 
+    def _frozen(self, psi, phin, phip):
+        """Positions in V of carrier-free continuity unknowns (n < freeze_n) that the joint Newton holds fixed:
+        their rows and Phi_n columns scale with n (~1e-40 at deep off-state), so their Newton components are
+        meaningless (up to 1e13 V) and, through the step clip, throttle the whole step."""
+        if self.cfg.freeze_n <= 0:
+            return None
+        eq = self.eq
+        with torch.no_grad():
+            Ec, Ev, n, p, gn, gp = eq.bands(psi, phin, phip)
+            # interface-trap vertices: the trap occupancy, and so the charge, follows n down to ~n1 (~1e-5 cm^-3 for
+            # the AlGaN/HfO2 level), so they are only frozen once n < 1e-3 n1 (traps fully ionised)
+            thr = torch.full_like(n, self.cfg.freeze_n)
+            for idx, conc, emid, cc, K in eq.traps:
+                Et = (Ec[idx] + Ev[idx]) / 2 + KT / 2 * torch.log(eq.Nv[idx] / eq.Nc[idx]) + emid
+                n1 = gn[idx] * eq.Nc[idx] * torch.exp((Et - Ec[idx]) / KT)
+                thr[idx] = torch.minimum(thr[idx], 1e-3 * n1)
+        f = n[self.Vt] < thr[self.Vt]
+        return f if bool(f.any()) else None
+
+    def _unit_rows(self, J, rows):
+        """CSR J with the given rows replaced by unit rows (the sparsity pattern, and so the cached cuDSS analysis,
+        is kept)."""
+        xp = self.bk.xp
+        J = J.tocsr(); J.sum_duplicates(); J.sort_indices()
+        nr = J.shape[0]
+        rid = xp.searchsorted(J.indptr, xp.arange(J.nnz), side="right") - 1
+        fr = xp.zeros(nr, dtype=bool); fr[rows] = True
+        m = fr[rid]
+        J.data[m] = 0.0
+        J.data[m & (J.indices == rid)] = 1.0
+        return J
+
     def joint_newton(self, psi, phin, phip, bounds, maxit=None, stall_check=False):
         cfg, bk, eq = self.cfg, self.bk, self.eq
         maxit = cfg.newton_maxit if maxit is None else maxit
         U, V = self.Ut, self.Vt
+        nU = len(self.U)
         KUU = self.KUU
-        def merit(o, cs):
+        def merit(o, cs, keep=None):
             a = o["Fp"][U] / eq.pdiag[U]; b = o["Fc"][V] / cs
+            if keep is not None:
+                b = b[keep]
             return (float(torch.sqrt((torch.cat([a, b]) ** 2).mean())), float(torch.sqrt((a ** 2).mean())),
                     float(torch.sqrt((b ** 2).mean())))
-        hist = []; good = (psi.clone(), phin.clone()); delta = cfg.ptc
+        hist = []; good = (psi.clone(), phin.clone()); delta = cfg.ptc; best = None
+        mj = cfg.mobility_jacobian
+        exact_failed = False
         for it in range(maxit + 1):
+            frz = self._frozen(psi, phin, phip)
+            keep = None if frz is None else ~frz
+            if mj in ("exact", "lagged"):
+                eq.lag_mobility = mj == "lagged"
+            elif mj == "hybrid":
+                if hist and not eq.lag_mobility and hist[-1][0] > 0.5 * hist[-2][0]:
+                    exact_failed = True                 # the exact model did not pay off: lagged from here on
+                eq.lag_mobility = exact_failed or not hist or hist[-1][0] > cfg.hybrid_switch
             o = self._eval(psi, phin, phip, True)
             cs = torch.clamp(o["mc"][V], min=1e-30 + cfg.cont_floor * float(o["mc"][V].median()))
-            m, mp, mc = merit(o, cs)
+            m, mp, mc = merit(o, cs, keep)
             if not np.isfinite(m):
                 psi, phin = good; break
             good = (psi.clone(), phin.clone()); hist.append((m, mp, mc))
+            if cfg.keep_best and (best is None or m < best[0][0]):
+                best = ((m, mp, mc), psi.clone(), phin.clone())
             if it == maxit or m < cfg.newton_tol:
                 break
             w = cfg.stall_window
@@ -232,19 +301,63 @@ class Solver:
                     delta = max(delta * hist[-1][0] / hist[-2][0], 0.0)
                 J = J - delta * bk.sp.identity(J.shape[0], format="csr")
             rhs = torch.cat([-o["Fp"][U] / eq.pdiag[U], -o["Fc"][V] / cs])
+            if frz is not None:
+                J = self._unit_rows(J, bk.arr(torch.nonzero(frz)[:, 0] + nU))
+                rhs[nU:][frz] = 0.0
             dx = bk.tens(bk.solve(J, bk.arr(rhs), key="joint")).to(DT)
             if not bool(torch.isfinite(dx).all()):
                 break
-            dpsi, dphi = dx[:len(self.U)], dx[len(self.U):]
+            if cfg.trace:
+                lin_res = float(torch.linalg.norm(bk.tens(J @ bk.arr(dx)).to(DT) - rhs) / torch.linalg.norm(rhs))
+            dpsi, dphi = dx[:nU], dx[nU:]
             smax = float(dx.abs().max()); lam = min(1.0, cfg.newton_clip / smax) if smax > 0 else 1.0
+            lam0, nls = lam, 0
             while True:
                 tp, tf = psi.clone(), phin.clone(); tp[U] += lam * dpsi; tf[V] = torch.clamp(tf[V] + lam * dphi, *bounds)
                 ot = self._eval(tp, tf, phip, False)
-                if merit(ot, cs)[0] < m or lam < 1e-4: break
-                lam /= 2
+                mt = merit(ot, cs, keep)[0]
+                if mt < m or lam < cfg.lam_min: break
+                lam /= 2; nls += 1
+            if cfg.trace:
+                with torch.no_grad():
+                    _, _, nn, _, _, _ = eq.bands(psi, phin, phip)
+                    iv = int(dphi.abs().argmax())
+                    self._trace.append(dict(it=it, m=m, mp=mp, mc=mc, mt=mt, lam0=lam0, lam=lam, nls=nls,
+                                            dpsi=float(dpsi.abs().max()), dphi=float(dphi.abs().max()),
+                                            n_at_dphi=float(nn[self.V[iv]]), frozen=0 if frz is None else int(frz.sum()),
+                                            lin_res=lin_res))
             psi, phin = tp, tf
             if smax * lam < 1e-12: break
+        if best is not None and best[0][0] < hist[-1][0]:
+            psi, phin = best[1], best[2]
+            hist.append(best[0])
         return psi, phin, hist
+
+    def fill_frozen(self, psi, phin, phip, bounds):
+        """Phi_n of the carrier-free vertices (n < freeze_n) from the linear SG electron balance incl. generation,
+        psi and all other vertices fixed (in n the balance is linear: one exact solve)."""
+        frz = self._frozen(psi, phin, phip)
+        if frz is None:
+            return phin, 0
+        bk, eq = self.bk, self.eq
+        r, c, v, nfull = eq.electron_sg_operator(psi, phin, phip)
+        act = self.Vt[frz]
+        act = act[nfull[act] > 1e-250]
+        if not len(act):
+            return phin, 0
+        mask = torch.ones(self.n, dtype=torch.bool, device=self.dev); mask[act] = False
+        fix = torch.nonzero(mask)[:, 0]
+        A = bk.coo(r, c, v, (self.n, self.n))
+        Pa, Pf = self._sel(act.cpu().numpy()), self._sel(fix.cpu().numpy())
+        s = nfull[act]
+        rhs = -((Pa @ A @ Pf.T) @ bk.arr(nfull[fix])) - bk.arr(eq.last_sg_b[act])
+        y = bk.tens(bk.solve((Pa @ A @ Pa.T) @ bk.sp.diags(bk.arr(s)), rhs, key="fill")).to(DT)
+        if not bool(torch.isfinite(y).all()):
+            return phin, 0
+        nn = nfull.clone(); nn[act] = torch.clamp(y * s, min=1e-300)
+        new = eq.phin_from_n(psi, nn)
+        phin = phin.clone(); phin[act] = torch.clamp(new[act], *bounds)
+        return phin, len(act)
 
     def holes(self, psi, phin, phip):
         bk, eq = self.bk, self.eq
@@ -278,15 +391,22 @@ class Solver:
         """guess: (n,3) psi, Phi_n, Phi_p [V] in DF-ISE vertex order (e.g. a GNN prediction)."""
         self.bk.activate()
         md, cfg = self.md, self.cfg
+        self._trace = []
+        extra = {}
         t0 = time.monotonic()
         pd, phin, phip = self.boundary(guess, vg, vd)
         psi = np.asarray(guess, float)[:, 0].copy(); fin = np.isfinite(pd); psi[fin] = pd[fin]
-        bounds = (min(0.0, vd) - cfg.phin_margin, max(0.0, vd) + cfg.phin_margin)
+        lo_b = min(0.0, vd, vg) if cfg.gate_bounds else min(0.0, vd)
+        bounds = (lo_b - cfg.phin_margin, max(0.0, vd) + cfg.phin_margin)
         semi = md.semi
+        if cfg.equilibrium_vd0 and abs(vd) < 1e-12:
+            return self._equilibrium(guess, psi, t0)
         phin = np.where(semi & ~md.dirichlet, np.clip(phin, *bounds), phin)
         P, Fn, Fp = self.t(psi), self.t(np.where(semi, phin, 0.0)), self.t(np.where(semi, phip, 0.0))
+        Fp = self._tie_holes(P, Fn, Fp)
         t1 = time.monotonic()
         P, Fn, gh = self.gummel(P, Fn, Fp, bounds)
+        Fp = self._tie_holes(P, Fn, Fp)
         t2 = time.monotonic()
         nh_all, n_g = [], len(gh)
         budget = cfg.newton_maxit
@@ -297,12 +417,19 @@ class Solver:
             if not nh or nh[-1][0] < cfg.newton_tol or budget <= 0:
                 break
             P, Fn, g2 = self.gummel(P, Fn, Fp, bounds, iters=cfg.restart_gummel); n_g += len(g2)
+            Fp = self._tie_holes(P, Fn, Fp)
         nh = nh_all
+        if cfg.freeze_n > 0:
+            Fn, extra["filled"] = self.fill_frozen(P, Fn, Fp, bounds)
         t3 = time.monotonic()
         # hole start: Phi_p = Phi_n (p ~ n_i^2/n), with p limited to [~1e-100, ~1e10] cm^-3 so that the column
         # scaling of the linear hole solve stays representable (Phi_n is meaningless where n ~ 0)
         Ev = self.eq.C0 - self.eq.chi - P - self.eq.Eg
         Fh = self.holes(P, Fn, torch.clamp(Fn, -Ev - 276 * KT, -Ev - 21 * KT))
+        Fh = self._tie_holes(P, Fn, Fh)
+        if cfg.final_poisson:
+            # psi consistent with the quasi-Fermi levels actually written (filled carrier-free Phi_n, tied hole layer)
+            P, extra["final_poisson"] = self.poisson_newton(P, Fn, torch.where(self.eq.semi, Fh, 0 * Fh), cfg.poisson_maxit)
         t4 = time.monotonic()
         out_n = np.where(semi, Fn.cpu().numpy(), np.asarray(guess, float)[:, 1])
         if not (np.isfinite(P.cpu().numpy()).all() and np.isfinite(out_n).all() and bool(torch.isfinite(Fh).all())):
@@ -311,9 +438,42 @@ class Solver:
         lo, hi = min(0.0, vg, vd) - 1.0, max(0.0, vg, vd) + 1.0
         out_p = np.where(semi, np.clip(Fh.cpu().numpy(), lo, hi), np.asarray(guess, float)[:, 2])
         m = nh[-1] if nh else (np.nan, np.nan, np.nan)
+        if cfg.trace:
+            extra["trace"] = self._trace
         return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m[0] < 1e-6), n_g, len(nh),
                             float(m[0]), float(m[1]), float(m[2]),
-                            dict(boundary=t1 - t0, gummel=t2 - t1, newton=t3 - t2, holes=t4 - t3, total=t4 - t0))
+                            dict(boundary=t1 - t0, gummel=t2 - t1, newton=t3 - t2, holes=t4 - t3, total=t4 - t0),
+                            extra)
+
+    def _equilibrium(self, guess, psi, t0):
+        """Vd = 0 (every contact grounded, the gate insulated): no current flows, so Phi_n = Phi_p = 0 exactly and
+        only the nonlinear Poisson equation is left (monotone; damped Newton converges from any guess)."""
+        md, eq = self.md, self.eq
+        z = torch.zeros(self.n, dtype=DT, device=self.dev)
+        t1 = time.monotonic()
+        P, mp = self.poisson_newton(self.t(psi), z, z, max(self.cfg.poisson_maxit, 200))
+        t2 = time.monotonic()
+        o = self._eval(P, z, z, False)
+        V = self.Vt
+        cs = torch.clamp(o["mc"][V], min=1e-30 + self.cfg.cont_floor * float(o["mc"][V].median()))
+        a = o["Fp"][self.Ut] / eq.pdiag[self.Ut]; b = o["Fc"][V] / cs
+        m = float(torch.sqrt((torch.cat([a, b]) ** 2).mean()))
+        g = np.asarray(guess, float)
+        out_n = np.where(md.semi, 0.0, g[:, 1]); out_p = np.where(md.semi, 0.0, g[:, 2])
+        return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m < 1e-6), 0, 0, m,
+                            float(torch.sqrt((a ** 2).mean())), float(torch.sqrt((b ** 2).mean())),
+                            dict(boundary=t1 - t0, gummel=0.0, newton=t2 - t1, holes=0.0, total=t2 - t0),
+                            {"equilibrium": True})
+
+    def _tie_holes(self, psi, phin, phip):
+        cfg = self.cfg
+        if cfg.hole_tie is None:
+            return phip
+        with torch.no_grad():
+            _, _, n, _, _, _ = self.eq.bands(psi, phin, phip)
+        dep = (n < cfg.hole_tie_nmax) & self.eq.semi
+        dep[self.Dt] = False
+        return torch.where(dep, phin + cfg.hole_tie, phip)
 
     def _contact_flow(self, psi, phin, phip):
         """Per-vertex conventional current [A] flowing from the semiconductor into the metal (SG residuals of
