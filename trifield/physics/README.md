@@ -72,7 +72,11 @@ Python >= 3.14, or the `zstd` CLI.
 5. Phi_p from the linear hole continuity; on carrier-free vertices (n < 1e-10) Phi_p = Phi_n - 0.25 V
    (`hole_tie`, also used during the solve), because the lagged linear hole solve collapses a hole inversion
    layer (deep off-state) to p ~ 0 while psi was solved with one.
-6. A final nonlinear Poisson solve makes psi consistent with the quasi-Fermi levels written.
+6. After convergence the contact-metal drop (`metal_drop`, up to ~1.5 mV at on-state) is put into the ohmic boundary
+   values and Newton re-converges (`metal_boundary`), so the metal state the twin writes is consistent with the
+   interior. Adding the drop only at the contact vertices of a solution computed with Phi = V there made Sentaurus
+   fail or slow down at high current (101 (5,3): 61+ iterations, 15 without the metal state, 11 with this step).
+7. A final nonlinear Poisson solve makes psi consistent with the quasi-Fermi levels written.
 
 `RefineConfig(trace=True)` records per-iteration Newton diagnostics (merit parts, damping, step sizes,
 frozen count, linear-solve residual) in `RefineResult.extra["trace"]`.

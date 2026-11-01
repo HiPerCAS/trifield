@@ -46,6 +46,10 @@ class RefineConfig:
     # (unit rows) and their Phi_n is filled afterwards from the linear SG balance incl. generation (fill_frozen); 0 = off
     freeze_n: float = 1e-2
     final_poisson: bool = True       # after the hole solve: nonlinear Poisson with the output Phi_n / Phi_p
+    # after convergence: put the contact-metal drop (Solver.metal_drop) into the ohmic boundary values and re-converge
+    # (metal_newton iterations, twice), so that the twin's metal state is consistent with the interior solution
+    metal_boundary: bool = True
+    metal_newton: int = 8
     # electron Jacobian: "exact" (incl. d mu / d driving force), "lagged" (mobility frozen: the Caughey-Thomas cusp at
     # zero driving force, beta < 1, otherwise stalls the line search at near-equilibrium vertices), "hybrid" (lagged
     # while the merit > hybrid_switch, then exact), "default" (Equations.lag_mobility)
@@ -60,6 +64,7 @@ class RefineConfig:
     # instead of the lagged linear hole solve, which is singular under a hole inversion layer; None = off
     hole_tie: float | None = -0.25
     hole_tie_nmax: float = 1e-10
+    hole_tie_where: str = "all"      # "all" carrier-free vertices, or only "oxide" (semiconductor vertices touching HfO2)
 
 
 @dataclass
@@ -421,8 +426,17 @@ class Solver:
             P, Fn, g2 = self.gummel(P, Fn, Fp, bounds, iters=cfg.restart_gummel); n_g += len(g2)
             Fp = self._tie_holes(P, Fn, Fp)
         nh = nh_all
-        if cfg.freeze_n > 0:
-            Fn, extra["filled"] = self.fill_frozen(P, Fn, Fp, bounds)
+        if cfg.metal_boundary and nh and nh[-1][0] < 1e-6 and abs(vd) > 1e-12:
+            # contact metal state in the boundary condition: Sentaurus' ohmic vertices sit at the metal Fermi level
+            # V + drop (up to ~1.5 mV at on-state), not at V. Shift them (psi keeps its offset to Phi), re-converge
+            itf = self.t(md.metal_v & md.semi) > 0
+            for _ in range(2):
+                drop = self.t(self.metal_drop(P.cpu().numpy(), Fn.cpu().numpy(), Fp.cpu().numpy()))
+                d = torch.where(itf, drop - (Fn - self.t(md.electrode_bias(vg, vd))), torch.zeros_like(drop))
+                P, Fn, Fp = P + d, Fn + d, Fp + d
+                P, Fn, nh2 = self.joint_newton(P, Fn, Fp, bounds, maxit=cfg.metal_newton)
+                nh += nh2
+            extra["metal_drop_max"] = float(drop.abs().max())
         t3 = time.monotonic()
         # hole start: Phi_p = Phi_n (p ~ n_i^2/n), with p limited to [~1e-100, ~1e10] cm^-3 so that the column
         # scaling of the linear hole solve stays representable (Phi_n is meaningless where n ~ 0)
@@ -475,6 +489,13 @@ class Solver:
             _, _, n, _, _, _ = self.eq.bands(psi, phin, phip)
         dep = (n < cfg.hole_tie_nmax) & self.eq.semi
         dep[self.Dt] = False
+        if cfg.hole_tie_where == "oxide":
+            # only semiconductor vertices of oxide-touching elements (where the inversion layer forms); in the deeply
+            # depleted bulk (n ~ 1e-40) the tie would imply p ~ 1e16 where Sentaurus has ~1e-11
+            if getattr(self, "_oxide_v", None) is None:
+                ox = np.zeros(self.n, bool); ox[np.unique(self.md.T[np.isin(self.md.emat, ("HfO2",))])] = True
+                self._oxide_v = torch.as_tensor(ox, device=self.dev)
+            dep = dep & self._oxide_v
         return torch.where(dep, phin + cfg.hole_tie, phip)
 
     def _contact_flow(self, psi, phin, phip):
