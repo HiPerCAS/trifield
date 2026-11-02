@@ -80,6 +80,8 @@ def main(argv=None):
     ap.add_argument("--keep", action="store_true", help="keep the Sentaurus run directories")
     ap.add_argument("--strict", action="store_true",
                     help="apply the convergence-yield filter to a mesh-only pool too (always on for full solves)")
+    ap.add_argument("--range", action="append", default=[], metavar="NAME=LO:HI",
+                    help="restrict the sampling range of one design variable (repeatable), e.g. Fw=0.08:0.14")
     ap.add_argument("--first_index", type=int, default=0,
                     help="index of the first design (names cand_/sim_<index>): keeps a further pool's names "
                          "disjoint from an earlier one's")
@@ -89,11 +91,19 @@ def main(argv=None):
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
+    from trifield.params import RANGES
+    box = {}
+    for spec in args.range:
+        k, v = spec.split("=")
+        lo, hi = map(float, v.split(":"))
+        if k not in RANGES or not RANGES[k][0] <= lo < hi <= RANGES[k][1]:
+            raise SystemExit(f"--range {spec}: outside {k} {RANGES.get(k)}")
+        box[k] = (lo, hi)
     tasks, idx = [], args.first_index
     fins = args.fins or list(range(args.min_fins, args.max_fins + 1))
     for nfins in fins:
         for _ in range(args.n_per_fins):
-            p = sample_design(rng, nfins, strict=args.strict or not args.mesh_only)
+            p = sample_design(rng, nfins, strict=args.strict or not args.mesh_only, ranges=box)
             if p is None:
                 continue
             tasks.append((idx, SimulationParams.from_dict(p), args.par, args.work_dir,

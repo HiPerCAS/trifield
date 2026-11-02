@@ -10,9 +10,11 @@ each z-scored across the pool:
 2. **novelty**      D(x): distance of the design to the training set in the
    normalised design space [0,1]^6 (+ fin count), i.e. how unlike anything the
    surrogate has seen it is (1 - similarity).
-3. **objective**    O(x): how good the design is. With ``--objectives twin`` the
-   objectives come from the warm-start twin itself (Sentaurus-accurate Id,max
-   and Vth, run on a shortlist); otherwise from the fast closed-form proxies.
+3. **objective**    O(x): how good the design is: z(log Id,max) + z(Vth)
+   (+ w_area z(log Id per footprint), ``params.footprint_current``: current per
+   chip area). With ``--objectives twin`` the objectives come from the
+   warm-start twin itself (Sentaurus-accurate Id,max and Vth, run on a
+   shortlist); otherwise from the fast closed-form proxies.
 4. **runtime**      R(x): how much the warm start is expected to struggle,
    from the physics residuals (current continuity + Poisson) of the predicted
    fields and the mesh size. A large residual means the prediction is far from
@@ -44,7 +46,7 @@ from trifield.data.dataset import group_by_design, load_graph
 from trifield.device_metrics import extract_device_metrics
 from trifield.inference import ensemble_uncertainty, load_ensemble, predict_ensemble
 from trifield.losses import ContinuityResidualLoss, PoissonResidualLoss, contact_mask
-from trifield.params import PARAM_ORDER, design_vector
+from trifield.params import PARAM_ORDER, design_vector, footprint_current
 
 log = logging.getLogger("trifield.active_learning")
 
@@ -111,17 +113,23 @@ def _z(x) -> np.ndarray:
 
 
 def combine(rows: list[dict], w_u=1.0, w_d=1.0, w_o=0.5, w_r=0.5, runtime_sign=1.0,
-            objective_key: str = "proxy") -> list[dict]:
-    """Add per-criterion z-scores and the total score; sort descending."""
+            objective_key: str = "proxy", w_area: float = 0.0) -> list[dict]:
+    """Add per-criterion z-scores and the total score; sort descending. ``w_area`` adds the current per
+    footprint (small area at high current) to the objective."""
     if not rows:
         return rows
     if objective_key == "twin":
-        idm = [r.get("id_max_twin") or 0.0 for r in rows]
+        ids = [r.get("id_max_twin") or 0.0 for r in rows]
+        idm = ids
         vth = [r.get("vth_twin") if r.get("vth_twin") is not None else -10.0 for r in rows]
     else:
-        idm = [np.log10(max(r["id_proxy"], 1e-30)) for r in rows]
+        ids = [r["id_proxy"] for r in rows]
+        idm = [np.log10(max(i, 1e-30)) for i in ids]
         vth = [r["vth_proxy"] for r in rows]
     obj = _z(idm) + _z(vth)
+    if w_area:
+        obj = obj + w_area * _z([np.log10(max(footprint_current(i, r["params"]), 1e-30)) if r.get("params") else 0.0
+                                 for i, r in zip(ids, rows)])
     # runtime: residuals of the predicted fields (log scale) and the mesh size
     rt = _z(np.log10(np.asarray([r["residual_cont"] for r in rows]) + 1e-12)) \
         + _z(np.log10(np.asarray([r["residual_pois"] for r in rows]) + 1e-12)) \
@@ -236,6 +244,7 @@ def main(argv=None):
     ap.add_argument("--w_novelty", type=float, default=1.0)
     ap.add_argument("--w_objective", type=float, default=0.5)
     ap.add_argument("--w_runtime", type=float, default=0.5)
+    ap.add_argument("--w_area", type=float, default=0.0, help="weight of z(log current per footprint) in the objective")
     ap.add_argument("--runtime_sign", type=float, default=1.0,
                     help="+1: prefer designs where the warm start will struggle; -1: penalise cost")
     ap.add_argument("--objectives", choices=["proxy", "twin"], default="proxy",
@@ -265,7 +274,7 @@ def main(argv=None):
         r["name"] = name
         rows.append(r)
     weights = dict(w_u=args.w_uncertainty, w_d=args.w_novelty, w_o=args.w_objective,
-                   w_r=args.w_runtime, runtime_sign=args.runtime_sign)
+                   w_r=args.w_runtime, runtime_sign=args.runtime_sign, w_area=args.w_area)
     rows = combine(rows, **weights)
     if args.objectives == "twin":
         short = rows[: 3 * args.top_k]

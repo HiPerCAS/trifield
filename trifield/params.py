@@ -71,6 +71,14 @@ def area_factor(params: dict) -> float:
     return 1e6 / (nfins * (perimeter + float(params["Fw"]) + SFIN))
 
 
+def footprint_current(id_ma_per_mm: float, params: dict) -> float:
+    """Drain current per mm of footprint width [mA/mm] from a current per mm of gate width (``area_factor``'s
+    width: N_fins (8 (T_GaN + T_AlGaN) + W_fin + S_fin)). The footprint of a fin is its pitch W_fin + S_fin
+    (times the fixed device length), so this ranks designs by current per chip area."""
+    per_fin = 8.0 * (float(params["GaN"]) + float(params["AlGaN"])) + float(params["Fw"]) + SFIN
+    return float(id_ma_per_mm) * per_fin / (float(params["Fw"]) + SFIN)
+
+
 def is_feasible(params: dict, strict: bool = False) -> bool:
     """Geometric feasibility of a multi-fin design.
 
@@ -90,10 +98,12 @@ def is_feasible(params: dict, strict: bool = False) -> bool:
 
 
 def sample_design(rng: np.random.Generator, nfins: int = 1,
-                  strict: bool = False, max_tries: int = 100) -> dict | None:
-    """Draw one feasible design uniformly over ``RANGES`` (plus ``FIXED``)."""
+                  strict: bool = False, max_tries: int = 100, ranges: dict | None = None) -> dict | None:
+    """Draw one feasible design uniformly over ``RANGES`` (plus ``FIXED``); ``ranges`` overrides some of the
+    bounds (e.g. a pool focused on narrow fins and thin oxides)."""
+    box = {**RANGES, **(ranges or {})}
     for _ in range(max_tries):
-        p = {k: float(rng.uniform(lo, hi)) for k, (lo, hi) in RANGES.items()}
+        p = {k: float(rng.uniform(lo, hi)) for k, (lo, hi) in box.items()}
         p.update(FIXED)
         p["Nfins"] = int(nfins)
         if is_feasible(p, strict=strict):
