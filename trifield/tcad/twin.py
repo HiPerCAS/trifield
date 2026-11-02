@@ -288,7 +288,7 @@ class Twin:
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
                  metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
                  trap_calibration: bool = True, ramp_race: tuple | None = None, nbguess_dv: float = 0.6,
-                 hole_stage: bool = False):
+                 hole_stage: bool = False, vth_floor: float = -6.0):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -334,6 +334,10 @@ class Twin:
         # each regula-falsi point on small meshes from the nearest converged solution instead of surrogate +
         # refinement (there CPU refinement costs ~20 s, the extra Sentaurus Newton steps a few seconds)
         self.vth_mode = vth_mode
+        # lowest gate bias the Vth search visits. A device still on at the floor has Vth < vth_floor and the
+        # result carries vth=None, vth_below_floor=True. vth_floor=0 screens for enhancement mode: a device that
+        # conducts at Vg = 0 is reported as d-mode without solving any negative gate bias.
+        self.vth_floor = float(vth_floor)
         # refine_device="auto": SuperLU on the CPU for small meshes (cuDSS is overhead-bound there: 14 s vs ~11-106 s
         # at 3k nodes), cuDSS on the GPU above `refine_cpu_below` vertices (17x faster at 25k nodes)
         self.refine_cpu_below = refine_cpu_below
@@ -773,7 +777,7 @@ class Twin:
         if not pts or pts[-1][1] <= 0:
             return None if not pts else vg11            # never turns on above target
         lo = hi = None
-        for vg in (0.0, -2.0, -4.0, -6.0):
+        for vg in [v for v in (0.0, -2.0, -4.0, -6.0) if v >= self.vth_floor - 1e-9]:
             cur = self.solve_point(vg, VD_HIGH)
             if cur is None:
                 continue
@@ -865,7 +869,7 @@ class Twin:
             return self.vth_search(vg11, i_on)
         if f0 > 0:                                                       # on at 0 V: walk down
             ladder = [round(-step * k, 6) for k in range(1, 5)] + [-3.0, -4.0, -5.0, -6.0]
-            for vg in ladder:
+            for vg in [v for v in ladder if v >= self.vth_floor - 1e-9]:
                 fv = at(vg)
                 if fv is not None and fv <= 0:
                     break
@@ -914,6 +918,17 @@ class Twin:
                 side = -1
         return xb - fb * (xb - xa) / (fb - fa)
 
+    def _below_floor(self, vth: float | None) -> bool:
+        """True when no Vth was found because the device still conducts at the lowest gate bias searched."""
+        if vth is not None:
+            return False
+        lowest = [r for r in self.log if r.get("converged") and abs(r["vd"] - VD_HIGH) < 1e-9
+                  and r["vg"] <= self.vth_floor + 1e-9 and r.get("current") is not None]
+        if self.vth_floor >= 0 and not lowest:
+            lowest = [r for r in self.log if r.get("converged") and abs(r["vd"] - VD_HIGH) < 1e-9
+                      and abs(r["vg"]) < 1e-9 and r.get("current") is not None]
+        return any(r["current"] > VTH_TARGET for r in lowest)
+
     def run(self) -> dict:
         t0 = time.monotonic()
         self.mesh_design()
@@ -938,6 +953,7 @@ class Twin:
             "id_max": i_on,
             "ron": (VD_LIN / i_lin * 1e3) if i_lin else None,
             "vth": vth,
+            "vth_below_floor": self._below_floor(vth),
             "wall_total": wall,
             "wall_without_mesh": wall - self.timing.get("mesh", 0.0),
             "sdevice_wall_sum": sum(r["wall"] for r in solves),
@@ -966,6 +982,8 @@ def main(argv=None):
     ap.add_argument("--no_escalate", action="store_true")
     ap.add_argument("--no_refine", action="store_true", help="raw surrogate guess (ablation)")
     ap.add_argument("--feature_version", type=int, default=None, help="graph features of the checkpoints")
+    ap.add_argument("--vth_floor", type=float, default=-6.0, help="lowest Vg of the Vth search; 0 = report "
+                    "devices that conduct at Vg = 0 as d-mode (Vth < 0) without solving negative gate biases")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     params = SimulationParams.from_dict(json.loads(Path(args.design).read_text()))
@@ -979,7 +997,7 @@ def main(argv=None):
         cfg.newton_maxit, cfg.restarts = args.refine_cap, 1
     res = Twin(params, args.run_dir, models, args.par, args.mode, args.device, refine=not args.no_refine,
                refine_device=args.refine_device, refine_config=cfg, feature_version=args.feature_version,
-               refine_escalate=None if args.no_escalate else RefineConfig()).run()
+               refine_escalate=None if args.no_escalate else RefineConfig(), vth_floor=args.vth_floor).run()
     for r in res.pop("solves"):
         log.info("  solve %-8s Vg=%6.3f Vd=%5.2f  conv=%s newton=%3d  %.1f s", r["tag"], r["vg"], r["vd"],
                  r["converged"], r["newton"], r["wall"])
