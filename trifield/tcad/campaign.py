@@ -8,9 +8,14 @@
     python -m trifield.tcad.campaign --par parameter.par --out_dir runs/candidates \
         --n_per_fins 200 --max_fins 5 --workers 16 --seed 7 --mesh_only
 
+    # a further pool restricted to the design range the training data covers, numbered after an
+    # existing pool of 300 candidates (cand_000300, ...)
+    python -m trifield.tcad.campaign --par parameter.par --out_dir runs/candidates2 \
+        --n_per_fins 20 --min_fins 2 --max_fins 5 --seed 11 --mesh_only --strict --first_index 300
+
 Designs are sampled uniformly over ``trifield.params.RANGES`` per fin count,
-subject to the fin-spacing constraint (and, for full solves, the
-convergence-yield filter of the paper's campaign). A ``campaign_log.csv``
+subject to the fin-spacing constraint (and, for full solves or with
+``--strict``, the convergence-yield filter of the paper's campaign). A ``campaign_log.csv``
 with the sampled parameters, status and simulator FoMs is written next to the
 graphs. Use different seeds and output directories for disjoint train /
 validation sets.
@@ -73,17 +78,22 @@ def main(argv=None):
     ap.add_argument("--fins", type=int, nargs="+", default=None,
                     help="explicit fin counts (overrides --min_fins/--max_fins)")
     ap.add_argument("--keep", action="store_true", help="keep the Sentaurus run directories")
+    ap.add_argument("--strict", action="store_true",
+                    help="apply the convergence-yield filter to a mesh-only pool too (always on for full solves)")
+    ap.add_argument("--first_index", type=int, default=0,
+                    help="index of the first design (names cand_/sim_<index>): keeps a further pool's names "
+                         "disjoint from an earlier one's")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(args.seed)
-    tasks, idx = [], 0
+    tasks, idx = [], args.first_index
     fins = args.fins or list(range(args.min_fins, args.max_fins + 1))
     for nfins in fins:
         for _ in range(args.n_per_fins):
-            p = sample_design(rng, nfins, strict=not args.mesh_only)
+            p = sample_design(rng, nfins, strict=args.strict or not args.mesh_only)
             if p is None:
                 continue
             tasks.append((idx, SimulationParams.from_dict(p), args.par, args.work_dir,
