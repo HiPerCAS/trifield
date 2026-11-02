@@ -287,8 +287,8 @@ class Twin:
                  anchor_before_refine: bool = False, refine_config=None, feature_version: int | None = None,
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
                  metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
-                 trap_calibration: bool = True, ramp_race: tuple | None = None, nbguess_dv: float = 0.6,
-                 hole_stage: bool = False, vth_floor: float = -6.0):
+                 trap_calibration: bool = True, ramp_race: tuple | None = (1.0, 2.0), nbguess_dv: float = 1.0,
+                 hole_stage: bool = True, vth_floor: float = -6.0):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
