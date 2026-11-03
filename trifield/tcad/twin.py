@@ -358,8 +358,9 @@ class Twin:
         # process that saves the binary start and licence checkout (~0.9 s) and the device initialisation (1.2 s at
         # 3k vertices, 5.6 s at 13k); results are identical. servers: number of processes (None = min(max_parallel,
         # 2): the serialised GPU refinements stagger the points, so a third server rarely has work; each one holds a
-        # licence), 0 = one process per solve; server_threads: their --threads; server_plots: write each converged
-        # solve's plot TDR (neighbour guesses, labels). Races, ramps and cold solves keep their own processes.
+        # licence), 0 = one process per solve; server_threads: their --threads (> 1: faster Newton steps on large
+        # meshes, results equal to solver tolerance instead of bitwise); server_plots: write each converged solve's
+        # plot TDR (neighbour guesses, labels). Races, ramps and cold solves keep their own processes.
         self.servers = servers
         self.server_threads = server_threads
         self.server_plots = server_plots

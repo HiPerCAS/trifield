@@ -220,6 +220,22 @@ converged bias point of the same design as the starting point, more polishing, a
 neighbour, and finally a start from scratch. The threshold-voltage search steps in 0.5 V increments to
 a tight bracket around Vth.
 
+### Running Sentaurus
+
+Each bias point is one Sentaurus Device solve: load the polished prediction and run Newton at the
+target bias. Started as a program of its own, every solve also paid for the program start and licence
+(about 1 s) and for setting up the device (1 s at 3k mesh nodes, 6 s at 13k), more than its 5-7 Newton
+steps on small meshes. The twin therefore keeps two `sdevice` processes per design open in Sentaurus'
+Tcl mode ([`trifield/tcad/server.py`](trifield/tcad/server.py)): each sets up the device once and then
+solves one bias point per request (load the guess, one quasistationary step to the bias, Newton). The
+currents and Newton iterations are bitwise the same as with a separate process per point. Guesses are
+written straight from the mesh, so no template run is needed either. Voltage ramps, races and starts
+from scratch still run as separate processes. On the 13-design benchmark, run on the same day as the
+previous version, this cut Sentaurus' time from 1355 s to 778 s and the total from 0.49 h to 0.35 h
+(median speedup vs production 38x -> 53x; every design faster, by 1.2-1.7x). `--server_threads 4`
+speeds up the Newton steps on large meshes further (results then agree to solver tolerance instead of
+bitwise; Sentaurus needs one parallel licence per 4 threads).
+
 ### Active learning
 
 `trifield.active_learning` scores candidate designs (meshing takes seconds, no simulation) on four
