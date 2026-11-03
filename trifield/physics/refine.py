@@ -10,8 +10,9 @@ Holes carry no charge of consequence here but Sentaurus' convergence depends str
 """
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -29,9 +30,13 @@ class RefineConfig:
     gummel_relax: float = 0.5
     poisson_maxit: int = 50
     poisson_tol: float = 1e-10       # inner Poisson-Newton step tolerance [V]
+    gummel_poisson_maxit: int | None = None   # Poisson-Newton iterations per Gummel sweep (None = poisson_maxit)
     newton_maxit: int = 120
     newton_clip: float = 0.5
     newton_tol: float = 1e-9
+    # merit below which a refinement counts as converged (RefineResult.converged; the twin then trusts its current for
+    # the contact-metal state) and the metal drop is put into the boundary values (metal_boundary)
+    converged_tol: float = 1e-6
     hole_iters: int = 8
     phin_margin: float = 0.05
     ptc: float = 0.0                 # pseudo-transient continuation: J + delta*I (scaled), delta *= merit ratio
@@ -90,6 +95,7 @@ class Solver:
 
     def __init__(self, md: MeshData, device="cpu", config: RefineConfig | None = None):
         self.md = md
+        self._tl = threading.local()                  # per-call config override (refine(..., config=)), per thread
         self.cfg = config or RefineConfig()
         self.bk = Backend(device)
         self.dev = self.bk.device
@@ -110,6 +116,14 @@ class Solver:
         pos = -np.ones(self.n, int); pos[self.V] = np.arange(len(self.V))
         self.UinV = np.where(pos[self.U] >= 0)[0]; self.UinV_col = pos[self.U[self.UinV]]
         self.KUU = self.PU @ self.K @ self.PU.T                                       # constant Poisson block
+
+    @property
+    def cfg(self) -> RefineConfig:
+        return getattr(self._tl, "cfg", None) or self._cfg
+
+    @cfg.setter
+    def cfg(self, value: RefineConfig):
+        self._cfg = value
 
     def _sel(self, idx):
         r = torch.arange(len(idx), device=self.dev); c = torch.as_tensor(idx, device=self.dev)
@@ -190,8 +204,9 @@ class Solver:
         cfg, bk, eq = self.cfg, self.bk, self.eq
         V, Dn = self.Vt, self.Dt
         hist = []
+        pmax = cfg.poisson_maxit if cfg.gummel_poisson_maxit is None else cfg.gummel_poisson_maxit
         for it in range(cfg.gummel_iters if iters is None else iters):
-            psi, mp = self.poisson_newton(psi, phin, phip, cfg.poisson_maxit)
+            psi, mp = self.poisson_newton(psi, phin, phip, pmax)
             r, c, v, nfull = eq.electron_sg_operator(psi, phin, phip)
             A = bk.coo(r, c, v, (self.n, self.n))
             act, fix = self._split(V, nfull, Dn)
@@ -394,8 +409,19 @@ class Solver:
         return phip
 
     # ------------------------------------------------------------------ public
-    def refine(self, guess, vg, vd) -> RefineResult:
-        """guess: (n,3) psi, Phi_n, Phi_p [V] in DF-ISE vertex order (e.g. a GNN prediction)."""
+    def refine(self, guess, vg, vd, config: RefineConfig | dict | None = None) -> RefineResult:
+        """guess: (n,3) psi, Phi_n, Phi_p [V] in DF-ISE vertex order (e.g. a GNN prediction). `config`: a RefineConfig,
+        or a dict of RefineConfig fields overriding the solver's config, for this call only (thread safe)."""
+        if config is None:
+            return self._refine(guess, vg, vd)
+        prev = getattr(self._tl, "cfg", None)
+        self._tl.cfg = replace(self._cfg, **config) if isinstance(config, dict) else config
+        try:
+            return self._refine(guess, vg, vd)
+        finally:
+            self._tl.cfg = prev
+
+    def _refine(self, guess, vg, vd) -> RefineResult:
         self.bk.activate()
         md, cfg = self.md, self.cfg
         self._trace = []
@@ -426,7 +452,7 @@ class Solver:
             P, Fn, g2 = self.gummel(P, Fn, Fp, bounds, iters=cfg.restart_gummel); n_g += len(g2)
             Fp = self._tie_holes(P, Fn, Fp)
         nh = nh_all
-        if cfg.metal_boundary and nh and nh[-1][0] < 1e-6 and abs(vd) > 1e-12:
+        if cfg.metal_boundary and nh and nh[-1][0] < cfg.converged_tol and abs(vd) > 1e-12:
             # contact metal state in the boundary condition: Sentaurus' ohmic vertices sit at the metal Fermi level
             # V + drop (up to ~1.5 mV at on-state), not at V. Shift them (psi keeps its offset to Phi), re-converge
             itf = self.t(md.metal_v & md.semi) > 0
@@ -456,7 +482,7 @@ class Solver:
         m = nh[-1] if nh else (np.nan, np.nan, np.nan)
         if cfg.trace:
             extra["trace"] = self._trace
-        return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m[0] < 1e-6), n_g, len(nh),
+        return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m[0] < cfg.converged_tol), n_g, len(nh),
                             float(m[0]), float(m[1]), float(m[2]),
                             dict(boundary=t1 - t0, gummel=t2 - t1, newton=t3 - t2, holes=t4 - t3, total=t4 - t0),
                             extra)
@@ -476,7 +502,7 @@ class Solver:
         m = float(torch.sqrt((torch.cat([a, b]) ** 2).mean()))
         g = np.asarray(guess, float)
         out_n = np.where(md.semi, 0.0, g[:, 1]); out_p = np.where(md.semi, 0.0, g[:, 2])
-        return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m < 1e-6), 0, 0, m,
+        return RefineResult(P.cpu().numpy(), out_n, out_p, bool(m < self.cfg.converged_tol), 0, 0, m,
                             float(torch.sqrt((a ** 2).mean())), float(torch.sqrt((b ** 2).mean())),
                             dict(boundary=t1 - t0, gummel=0.0, newton=t2 - t1, holes=0.0, total=t2 - t0),
                             {"equilibrium": True})
