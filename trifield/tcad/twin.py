@@ -55,6 +55,11 @@ from trifield.tcad.simulation import (SDE_CMD, SDE_TEMPLATE, TEMPLATE_DIR, PLTFi
 log = logging.getLogger("trifield.tcad.twin")
 
 FIELD_FUNCS = ("ElectrostaticPotential", "eQuasiFermiPotential", "hQuasiFermiPotential")
+# Datasets of a guess TDR. Load takes the solution variables from them (psi, quasi-Fermi potentials, the contact metals'
+# QuasiFermiPotential; LatticeTemperature must be present in every region or the Load fails); the template's densities,
+# currents and trapped charge are not used (bitwise the same currents without them) but cost a third of the Load (2.4 ->
+# 1.6 s at 13k vertices) and of the guess conversion.
+GUESS_DATASETS = FIELD_FUNCS + ("QuasiFermiPotential", "LatticeTemperature")
 SDEVICE = ["sdevice", "-q", "-n", "--threads", "1"]
 VTH_TARGET = 1.0            # mA/mm, same criterion as the production find_vth
 LADDER_STEP = 0.5           # gate step of the Vth ladder (vth_search_ladder2)
@@ -153,10 +158,11 @@ def _match_brace(s: str, i: int) -> int:
     return -1
 
 
-def _rewrite_dat(src: Path, dst: Path, mesh=None, fields: dict | None = None) -> None:
+def _rewrite_dat(src: Path, dst: Path, mesh=None, fields: dict | None = None, only=None) -> None:
     """Copy a DF-ISE .dat, dropping datasets whose name contains '(' (they break
     ``tdx --dfise2tdr``) and, if ``fields`` is given, replacing the values of those
-    datasets with ``fields[name][region_vertex_indices[region]]``."""
+    datasets with ``fields[name][region_vertex_indices[region]]``. ``only``: names of the
+    only datasets to copy (None = all)."""
     txt = src.read_text(errors="replace")
     im = re.search(r"Info\s*\{", txt)
     info = txt[im.end():_match_brace(txt, im.end() - 1)]
@@ -165,9 +171,9 @@ def _rewrite_dat(src: Path, dst: Path, mesh=None, fields: dict | None = None) ->
     keep, names, funcs = [], [], []
     for m in re.finditer(r'Dataset\s*\("([^"]+)"\)\s*\{', data):
         name = m.group(1)
-        block = data[m.start():_match_brace(data, m.end() - 1) + 1]
-        if "(" in name:
+        if "(" in name or (only is not None and name not in only):
             continue
+        block = data[m.start():_match_brace(data, m.end() - 1) + 1]
         if fields is not None and name in fields:
             region = re.search(r'validity\s*=\s*\[\s*"([^"]+)"', block).group(1)
             vidx = mesh.region_vertex_indices.get(region)
@@ -765,7 +771,7 @@ class Twin:
         fields = {k: v for k, v in dict(fields).items() if not k.startswith("_")}
         if "QuasiFermiPotential" not in fields:
             fields["QuasiFermiPotential"] = electrode_fermi_levels(self.mesh, *self._bias[prefix])
-        _rewrite_dat(self.template_dat, work / f"{prefix}.dat", self.mesh, fields)
+        _rewrite_dat(self.template_dat, work / f"{prefix}.dat", self.mesh, fields, only=GUESS_DATASETS)
         _tdx(["--dfise2tdr", self.template_grd.name, f"{prefix}.dat", f"{prefix}_des.tdr"], work)
         if not (work / f"{prefix}_des.tdr").exists():
             raise RuntimeError(f"writing the initial guess {prefix} failed")
