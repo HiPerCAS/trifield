@@ -402,6 +402,10 @@ class Twin:
         self.trap_overlap = trap_overlap
         self._traps_ready = threading.Event()
         self._traps_ready.set()
+        self._template_ready = threading.Event()             # cleared while prepare() writes the template
+        self._template_ready.set()
+        self._template_thread = None
+        self._template_error = None
         self._trap_thread = None
         self._trap_cv = threading.Condition()
         self._refining = 0
@@ -434,8 +438,10 @@ class Twin:
         self.timing["mesh"] = t["wall"]
         self.timing["mesh_cpu"] = t["cpu"]
 
-    def prepare(self) -> None:
-        """Parameter file, mesh parse, and a solution-structured template TDR."""
+    def prepare(self, wait_template: bool = True) -> None:
+        """Parameter file, mesh parse, and a solution-structured template TDR. wait_template=False: return once the
+        mesh is parsed and the per-mesh physics is ready and write the template in the background (write_guess waits
+        for it), so that the first points' predictions and refinements overlap with the template's sdevice run."""
         from trifield.data.tdr_extract import convert_tdr_to_dfise, parse_dat, parse_grd, collect_node_fields
         t0 = time.monotonic()
         work = self.run_dir / "twin"
@@ -465,19 +471,13 @@ class Twin:
             physics = threading.Thread(target=self.prepare_physics, daemon=True)
             physics.start()
         if self.mode == "warm":
-            # a zero-iteration run writes a TDR with the exact per-region dataset
-            # layout sdevice expects to Load; its values are overwritten later. With servers the first
-            # one writes it: the plot of a freshly initialised device has the same layout.
-            if not self._start_servers():
-                deck = make_deck(self.base, "tmpl", 0.0, 0.0,
-                                 "\tCoupled(Iterations= 0){ Poisson Electron Hole }\n\tPlot(FilePrefix= \"tmpl\")",
-                                 grid=GRID, math_extra="RHSMin= 1e30")
-                (work / "tmpl.cmd").write_text(deck)
-                run_timed(SDEVICE + ["tmpl.cmd"], work, 600, work / "tmpl.out", work / "tmpl.err", check=False)
-            tmpl = next(iter(sorted(work.glob("tmpl*_des.tdr"))), None)
-            if tmpl is None:
-                raise RuntimeError(f"template dump failed, see {work / 'tmpl.out'}")
-            self.template_grd, self.template_dat = convert_tdr_to_dfise(tmpl, work, "tmpl", traditional=False)
+            self._template_ready.clear()
+            self._template_thread = threading.Thread(target=self._make_template, args=(t0,), daemon=True)
+            self._template_thread.start()
+            if wait_template:
+                self._template_thread.join()
+                if self.template_dat is None:
+                    raise RuntimeError(f"template dump failed ({self._template_error}), see {work / 'tmpl.out'}")
         self.timing["prepare"] = time.monotonic() - t0
         if physics is not None:
             physics.join()
@@ -495,6 +495,30 @@ class Twin:
                     self._trap_thread.start()
                 else:
                     self.calibrate_traps()
+
+    def _make_template(self, t0: float) -> None:
+        """A zero-iteration run writes a TDR with the exact per-region dataset layout sdevice expects to Load; its
+        values are overwritten later. With servers the first one writes it: the plot of a freshly initialised
+        device has the same layout."""
+        from trifield.data.tdr_extract import convert_tdr_to_dfise
+        work = self.run_dir / "twin"
+        try:
+            if not self._start_servers():
+                deck = make_deck(self.base, "tmpl", 0.0, 0.0,
+                                 "\tCoupled(Iterations= 0){ Poisson Electron Hole }\n\tPlot(FilePrefix= \"tmpl\")",
+                                 grid=GRID, math_extra="RHSMin= 1e30")
+                (work / "tmpl.cmd").write_text(deck)
+                run_timed(SDEVICE + ["tmpl.cmd"], work, 600, work / "tmpl.out", work / "tmpl.err", check=False)
+            tmpl = next(iter(sorted(work.glob("tmpl*_des.tdr"))), None)
+            if tmpl is None:
+                raise RuntimeError("no template TDR")
+            self.template_grd, self.template_dat = convert_tdr_to_dfise(tmpl, work, "tmpl", traditional=False)
+        except Exception as exc:                                          # noqa: broad-except
+            self._template_error = exc
+            log.warning("template dump failed (%s), see %s", exc, work / "tmpl.out")
+        finally:
+            self.timing["template"] = time.monotonic() - t0
+            self._template_ready.set()
 
     def _start_servers(self) -> bool:
         """Start the persistent sdevice processes and have the first one write the template (tmpl_des.tdr).
@@ -523,6 +547,8 @@ class Twin:
 
     def close(self) -> None:
         """Stop the sdevice servers (run() does this at the end; callers of solve_point should)."""
+        if self._template_thread is not None:
+            self._template_thread.join(600)
         pool, self._pool = self._pool, None
         if pool is not None:
             cpu = pool.close()
@@ -568,7 +594,10 @@ class Twin:
         ionised (Phi_n = +20 V, Phi_p = -20 V in the semiconductor); cached in work/physics/trap_factors.pkl and applied
         to the refinement solvers (trifield.physics.export.trap_factors). Without it the refined psi is up to ~1 V off
         Sentaurus' at a few AlGaN/HfO2 corner vertices under the gate, where Sentaurus' first Newton steps then go astray."""
-        if self.solver is None or self.template_dat is None:
+        if self.solver is None:
+            return
+        self._template_ready.wait()
+        if self.template_dat is None:
             return
         import pickle
         from trifield.physics.export import trap_factors
@@ -725,6 +754,9 @@ class Twin:
     def write_guess(self, fields: dict, prefix: str, vg: float | None = None,
                     vd: float | None = None) -> None:
         """Prediction -> DF-ISE -> TDR on the round-tripped grid."""
+        self._template_ready.wait()
+        if self.template_dat is None:
+            raise RuntimeError(f"no template to write the guess {prefix} ({self._template_error})")
         t0 = time.monotonic()
         work = self.run_dir / "twin"
         self._bias = getattr(self, "_bias", {})
@@ -1116,7 +1148,7 @@ class Twin:
 
     def _run(self, t0: float) -> dict:
         self.mesh_design()
-        self.prepare()
+        self.prepare(wait_template=False)
         vg11 = float(self.params.Vg11)
         # the ladder's first points are known in advance: the 0 V point always, and for an e-mode screen
         # (vth_floor >= 0, where a device that is on at 0 V needs no further point) the first step up, which every
