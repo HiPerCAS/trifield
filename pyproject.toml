@@ -36,7 +36,7 @@ Paper = "https://doi.org/10.1145/3831252.3834249"
 Repository = "https://github.com/HiPerCAS/trifield"
 
 [tool.setuptools]
-packages = ["trifield", "trifield.data", "trifield.tcad"]
+packages = ["trifield", "trifield.data", "trifield.physics", "trifield.tcad"]
 
 [tool.setuptools.package-data]
 "trifield.tcad" = ["templates/*.cmd", "README.md"]
