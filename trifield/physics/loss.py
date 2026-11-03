@@ -42,7 +42,11 @@ class PhysicsLossConfig:
     w_electron: float = 1.0
     w_hole: float = 0.0
     poisson_norm: str = "jacobi"          # "pdiag" (refinement merit) or "jacobi"
-    rho: str = "log"                      # "sq" or "log"
+    rho: str = "log"                      # "sq" or "log" (both terms unless overridden below)
+    rho_poisson: str | None = None        # e.g. "sq": no saturation of the Poisson rows (a saturated Poisson penalty
+                                          # lets an unanchored prediction deplete the device and freeze every
+                                          # continuity row: physics-only test-time training found that state)
+    freeze_from_labels: bool = True       # labelled graphs: carrier-free rows from the label fields, not the prediction
     scale_poisson: float = 0.1            # rho scale s [V-equivalent] of the Poisson rows
     scale_cont: float = 0.1               # rho scale of the continuity rows (|r / gross| <= 1)
     freeze_n: float = 1e-2                # cm^-3, as RefineConfig.freeze_n
@@ -158,8 +162,9 @@ class MeshPhysics:
         return r, g, p
 
     # ------------------------------------------------------------------ residuals
-    def residuals(self, fields, vg, vd, cfg: PhysicsLossConfig | None = None, holes: bool | None = None):
-        """Normalised residual rows of a (n,3) field triple: dict(poisson, electron[, hole], n_frozen)."""
+    def residuals(self, fields, vg, vd, cfg: PhysicsLossConfig | None = None, holes: bool | None = None, ref=None):
+        """Normalised residual rows of a (n,3) field triple: dict(poisson, electron[, hole], n_frozen). ``ref``: fields
+        that decide the carrier-free (dropped) continuity rows instead of the prediction (e.g. the labels)."""
         cfg = cfg or PhysicsLossConfig()
         eq = self.eq
         psi, phin, phip = self.apply_boundary(fields, vg, vd)
@@ -184,7 +189,10 @@ class MeshPhysics:
             r = r - RV; m = m + RV.detach().abs()
         V = self.V
         with torch.no_grad():
-            Ec, Ev, n, p, gn, gp = eq.bands(psi.detach(), phin.detach(), phip.detach())
+            if ref is not None:
+                Ec, Ev, n, p, gn, gp = eq.bands(*self.apply_boundary(ref.detach(), vg, vd))
+            else:
+                Ec, Ev, n, p, gn, gp = eq.bands(psi.detach(), phin.detach(), phip.detach())
             thr = torch.full_like(n, cfg.freeze_n)
             for idx, conc, emid, cc, K in eq.traps:
                 Et = (Ec[idx] + Ev[idx]) / 2 + KT / 2 * torch.log(eq.Nv[idx] / eq.Nc[idx]) + emid
@@ -258,11 +266,11 @@ class ExactPhysicsLoss(torch.nn.Module):
         self.reg = registry
         self.cfg = cfg or PhysicsLossConfig()
 
-    def graph_terms(self, pred, design, vg, vd):
+    def graph_terms(self, pred, design, vg, vd, ref=None):
         cfg = self.cfg
         mp = self.reg.get(design)
-        res = mp.residuals(pred, vg, vd, cfg)
-        terms = {"poisson": rho(res["poisson"], cfg.rho, cfg.scale_poisson).mean()}
+        res = mp.residuals(pred, vg, vd, cfg, ref=ref)
+        terms = {"poisson": rho(res["poisson"], cfg.rho_poisson or cfg.rho, cfg.scale_poisson).mean()}
         e = res["electron"]
         terms["electron"] = rho(e, cfg.rho, cfg.scale_cont).mean() if len(e) else pred.new_zeros((), dtype=DT)
         if cfg.w_hole > 0:
@@ -284,7 +292,12 @@ class ExactPhysicsLoss(torch.nn.Module):
         for i, d in enumerate(names):
             if d not in self.reg:
                 continue
-            tot, terms, merit = self.graph_terms(pred_phys[ptr[i]:ptr[i + 1]], d, vgs[i], vds[i])
+            ref = None
+            if self.cfg.freeze_from_labels and hasattr(batch, "y") and batch.y is not None:
+                v = getattr(batch, "y_valid", None)
+                if v is None or bool(v[ptr[i]:ptr[i + 1]].all()):
+                    ref = batch.y[ptr[i]:ptr[i + 1]]
+            tot, terms, merit = self.graph_terms(pred_phys[ptr[i]:ptr[i + 1]], d, vgs[i], vds[i], ref)
             total = tot if total is None else total + tot
             n += 1
             for k, v in terms.items():

@@ -116,7 +116,8 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
           channel_weight=0.0, gate_weight=0.0, edge_weight=0.0, hybrid_from=None, hybrid_x="",
           hybrid_edge="", hybrid_drop_valid=False, exact_weight=0.0, exact_roots="", exact_norm="jacobi",
           exact_rho="log", exact_scale=0.1, exact_w_poisson=1.0, exact_w_electron=1.0, exact_start=1, exact_ramp=0,
-          unlabeled_dir=None, unlabeled_per_design=0, unlabeled_exclude="", progress_every=0, pseudo_dir=None):
+          unlabeled_dir=None, unlabeled_per_design=0, unlabeled_exclude="", progress_every=0, pseudo_dir=None,
+          exact_rho_poisson="", exact_freeze_pred=False):
     args = {k: v for k, v in locals().items()}
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -176,7 +177,8 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
         reg = PhysicsRegistry([r for r in exact_roots.split(",") if r], dev)
         exact = ExactPhysicsLoss(reg, PhysicsLossConfig(
             w_poisson=exact_w_poisson, w_electron=exact_w_electron, poisson_norm=exact_norm, rho=exact_rho,
-            scale_poisson=exact_scale, scale_cont=exact_scale))
+            scale_poisson=exact_scale, scale_cont=exact_scale, rho_poisson=exact_rho_poisson or None,
+            freeze_from_labels=not exact_freeze_pred))
         log.info("exact physics loss: weight %g, %d designs with exports", exact_weight, len(reg))
     optimizer = torch.optim.AdamW([{"params": model.parameters()},
                                    {"params": criterion.parameters(), "weight_decay": 0.0}],
@@ -340,6 +342,9 @@ def main(argv=None):
     ap.add_argument("--exact_norm", choices=["jacobi", "pdiag"], default="jacobi", help="Poisson row normalisation")
     ap.add_argument("--exact_rho", choices=["log", "sq"], default="log")
     ap.add_argument("--exact_scale", type=float, default=0.1, help="scale of the robust log penalty")
+    ap.add_argument("--exact_rho_poisson", default="", choices=["", "log", "sq"], help="penalty of the Poisson rows (default: --exact_rho)")
+    ap.add_argument("--exact_freeze_pred", action="store_true",
+                    help="carrier-free rows from the prediction also on labelled graphs (default: from the labels)")
     ap.add_argument("--exact_w_poisson", type=float, default=1.0)
     ap.add_argument("--exact_w_electron", type=float, default=1.0)
     ap.add_argument("--exact_start", type=int, default=1)
