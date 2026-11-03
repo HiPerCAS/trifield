@@ -20,6 +20,12 @@ the float32 labels), per design from the per-mesh exports (``export_mesh_data``)
 
 Loss = w_P mean rho(r_P) + w_n mean rho(r_n) + w_p mean rho(r_p), rho(x) = x^2 (``rho="sq"``) or s^2 log(1 + x^2 / s^2)
 (``rho="log"``, robust to a few huge rows early on), averaged over the graphs that have an export.
+
+Use ``norm_from="ref"``: normalisers and carrier-free mask from fixed reference fields (labels, or the first prediction of
+an unlabelled item). With the default "pred" they follow the prediction and are detached, which drops a gradient term as
+large as the kept one on badly balanced rows; descent then raises the loss (paired fine-tunes, palto scripts/al/RESULTS.md
+section 9: weight 0.1 doubled the field error). Even with a correct gradient the loss did not make fields more accurate;
+the equations add information through ``Solver.refine`` instead (``trifield.pseudolabel``).
 """
 from __future__ import annotations
 
