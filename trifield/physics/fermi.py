@@ -56,9 +56,13 @@ def gamma_of_eta(eta, r=None):
 
 
 # ------------------------------------------------------------------ torch
-def r_of_eta_t(eta, iters=30):
+def r_of_eta_t(eta, iters=6):
     """Differentiable n/N_C(eta): Newton without graph, then one differentiable step whose gradient is
-    the exact implicit-function derivative."""
+    the exact implicit-function derivative.
+
+    Newton on ln r converges to machine precision in 3-4 iterations for every eta (then the last bit
+    alternates with period 2), so 6 iterations give bitwise the same result as the former 30 (checked on
+    2.2e5 points, eta in [-700, 30]) at a fifth of the cost: this function dominated the refinement time."""
     import torch
     jd = torch.tensor(JD, dtype=eta.dtype, device=eta.device)
     kk = torch.arange(1, 5, dtype=eta.dtype, device=eta.device)
