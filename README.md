@@ -230,11 +230,12 @@ Tcl mode ([`trifield/tcad/server.py`](trifield/tcad/server.py)): each sets up th
 solves one bias point per request (load the guess, one quasistationary step to the bias, Newton). The
 currents and Newton iterations are bitwise the same as with a separate process per point. Guesses are
 written straight from the mesh, so no template run is needed either. Voltage ramps, races and starts
-from scratch still run as separate processes. On the 13-design benchmark, run on the same day as the
-previous version, this cut Sentaurus' time from 1355 s to 778 s and the total from 0.49 h to 0.35 h
-(median speedup vs production 38x -> 53x; every design faster, by 1.2-1.7x). `--server_threads 4`
-speeds up the Newton steps on large meshes further (results then agree to solver tolerance instead of
-bitwise; Sentaurus needs one parallel licence per 4 threads).
+from scratch still run as separate processes. On the 13-design benchmark (two runs of each version
+on the same day) this cut Sentaurus' time from about 1340 s to 780 s and the total from 0.49 h to
+0.35 h (median speedup vs production 38x -> 53x; every design 1.2-1.6x faster). With more threads per
+process (`--server_threads`, one parallel licence per 4 threads) the Newton steps get faster too:
+0.31 h with 2 threads, 0.27 h with 4 (68x); the results then agree to solver tolerance instead of
+bitwise.
 
 ### Active learning
 
