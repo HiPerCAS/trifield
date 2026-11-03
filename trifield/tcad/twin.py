@@ -8,7 +8,10 @@ design the twin
 3. writes the prediction into a Sentaurus solution file (TDR) on the original
    mesh, and
 4. runs ``sdevice`` with the production physics directly at that bias point,
-   ``Load``-ing the prediction as the initial guess (no voltage ramp).
+   ``Load``-ing the prediction as the initial guess (no voltage ramp). The solves
+   run in a few persistent ``sdevice`` processes per design (Sentaurus' Tcl mode,
+   ``trifield.tcad.server``) that initialise the device once, instead of one
+   process per bias point; the results are the same.
 
 The figures of merit therefore come from the simulator itself, so their
 accuracy is the simulator's; what the surrogate buys is time: a warm Newton
@@ -1279,6 +1282,10 @@ def main(argv=None):
     ap.add_argument("--no_escalate", action="store_true")
     ap.add_argument("--no_refine", action="store_true", help="raw surrogate guess (ablation)")
     ap.add_argument("--feature_version", type=int, default=None, help="graph features of the checkpoints")
+    ap.add_argument("--servers", type=int, default=None, help="persistent sdevice processes for the warm starts "
+                    "(default: min(max_parallel, 2); 0 = one sdevice process per solve)")
+    ap.add_argument("--server_threads", type=int, default=1, help="--threads of each persistent sdevice process "
+                    "(Sentaurus needs one parallel licence per 4 threads)")
     ap.add_argument("--vth_floor", type=float, default=-6.0, help="lowest Vg of the Vth search; 0 = report "
                     "devices that conduct at Vg = 0 as d-mode (Vth < 0) without solving negative gate biases")
     args = ap.parse_args(argv)
@@ -1294,7 +1301,8 @@ def main(argv=None):
         cfg.newton_maxit, cfg.restarts = args.refine_cap, 1
     res = Twin(params, args.run_dir, models, args.par, args.mode, args.device, refine=not args.no_refine,
                refine_device=args.refine_device, refine_config=cfg, feature_version=args.feature_version,
-               refine_escalate=None if args.no_escalate else RefineConfig(), vth_floor=args.vth_floor).run()
+               refine_escalate=None if args.no_escalate else RefineConfig(), vth_floor=args.vth_floor,
+               servers=args.servers, server_threads=args.server_threads).run()
     for r in res.pop("solves"):
         log.info("  solve %-8s Vg=%6.3f Vd=%5.2f  conv=%s newton=%3d  %.1f s", r["tag"], r["vg"], r["vd"],
                  r["converged"], r["newton"], r["wall"])

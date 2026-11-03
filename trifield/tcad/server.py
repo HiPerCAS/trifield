@@ -29,10 +29,11 @@ Why each piece:
 * ``sdevice_solve`` returns 1 even when the quasistationary failed, so success is decided by the current file: a
   converged step writes its row, a failed one writes none.
 
-Validated against one process per point (8 designs, every twin point): identical terminal currents (bitwise),
-identical Newton iteration counts and residual histories, identical plot TDR values; a failed request leaves no
-trace in the next one. The plot of a freshly initialised device has exactly the dataset layout of the twin's
-template, so the server also writes the template.
+Validated against one process per point on the same guess files (every request of the twin on 8 e-mode designs,
+incl. 27-38-step solves; deliberately failed requests): bitwise the same terminal currents, the same Newton residual
+histories, the same plot TDR values; a failed request leaves no trace in the next one. A server also plots a loaded
+state without solving (the twin's trap calibration; the plot of a freshly initialised device has the template's
+dataset layout).
 """
 from __future__ import annotations
 
@@ -135,10 +136,10 @@ class SdeviceServer:
     def start(self) -> "SdeviceServer":
         (self.work / f"{self.name}.tcl").write_text(_TCL % {"deck": self.init_deck})
         self.t_start = time.monotonic()
+        self._err = open(self.work / f"{self.name}.err", "wb")
         self.proc = subprocess.Popen(
             self.cmd + ["-n", "--threads", str(self.threads), "--tcl", f"{self.name}.tcl"], cwd=self.work,
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.work / f"{self.name}.err", "wb"),
-            text=True, bufsize=1)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err, text=True, bufsize=1)
         threading.Thread(target=self._reader, daemon=True, name=f"{self.name}-reader").start()
         return self
 
@@ -200,6 +201,11 @@ class SdeviceServer:
             self.proc.kill()
             self.proc.wait()
         self.dead = True
+        for f in (self.proc.stdin, self._err):
+            try:
+                f.close()
+            except Exception:                                            # noqa: broad-except
+                pass
         return cpu
 
     # ---- requests ----------------------------------------------------------------

@@ -114,7 +114,9 @@ not explained by interface-area rules, multiplicity, region or box volumes). The
 design: a state with every donor trap ionised (Phi_n = +20 V, Phi_p = -20 V in the semiconductor) is loaded
 and plotted after `Coupled(Iterations= 0)` with `RHSMin= 1e30` (without it Sentaurus moves the state), and
 NetTrappedCharge / ours gives a factor per vertex (one ~9 s sdevice run, cached in
-`work/physics/trap_factors.pkl`, applied with `Solver.set_trap_factors`). The factors equal those derived from
+`work/physics/trap_factors.pkl`, applied with `Solver.set_trap_factors`). When the twin's persistent sdevice
+servers are up (`trifield.tcad.server`), one of them loads the state and plots it without any solve: bitwise the
+same NetTrappedCharge and factors, in ~0.6 s instead of a process of its own. The factors equal those derived from
 converged deep off-state Sentaurus solutions to 1e-4, and with them those solutions satisfy our Poisson
 equation at the on-state floor (rms 5e-2 -> 5e-4).
 
