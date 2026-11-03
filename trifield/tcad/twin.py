@@ -743,8 +743,16 @@ class Twin:
             refine_info = None
             if refine and self.solver is not None:
                 on_state = abs(vg - float(self.params.Vg11)) < 1e-9
-                fields, refine_info = self.refine_fields(fields, vg, vd, wait_traps=not on_state,
-                                                         config=self.warm_refine if vg >= 0 else self.warm_refine_neg)
+                cfg = self.warm_refine if vg >= 0 else self.warm_refine_neg
+                raw = fields
+                fields, refine_info = self.refine_fields(raw, vg, vd, wait_traps=not on_state, config=cfg)
+                if (cfg is not None and cfg is self.warm_refine and not refine_info.get("converged")
+                        and "error" not in refine_info):
+                    # the fast schedule did not reach its tolerance (seen on an 8-fin design's on-state points: stalled at
+                    # merit ~1, Sentaurus then needed 26-48 steps or failed): redo the point as without warm_refine (full
+                    # schedule, trap factors applied)
+                    fields, info2 = self.refine_fields(raw, vg, vd, config=None)
+                    refine_info = {**info2, "fast": refine_info}
             gated = (self.gate_uncertainty is not None and unc is not None and unc > self.gate_uncertainty)
             if not gated:
                 # the metal drop follows the current the guess carries: trust it after a converged refinement
