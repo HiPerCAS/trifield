@@ -62,9 +62,13 @@ def convert_tdr_to_dfise(
     tdr_path: Path,
     output_dir: Path,
     output_base: str = "converted",
+    traditional: bool = True,
 ) -> Tuple[Path, Path]:
     """Convert a .tdr file to DF-ISE .grd + .dat text files.
 
+    traditional=False skips the coordinate-system step: for sdevice plots on a grid that went through DF-ISE (the
+    twin's grid_des.tdr: template, trap-calibration, constants and solution plots) the result is byte-identical and
+    one tdx run (~1.4 s at 13k vertices) cheaper. Keep it True for sde meshes (their .grd differs).
     Returns (grd_path, dat_path).
     """
     tdr_path = Path(tdr_path).resolve()
@@ -73,14 +77,15 @@ def convert_tdr_to_dfise(
 
     # Step 1: coordinate system → traditional
     trad_tdr = output_dir / f"{output_base}_trad.tdr"
-    _run_tdx(
-        ["--tdr-change-cs", "--traditional", str(tdr_path), str(trad_tdr)],
-        cwd=output_dir,
-    )
+    if traditional:
+        _run_tdx(
+            ["--tdr-change-cs", "--traditional", str(tdr_path), str(trad_tdr)],
+            cwd=output_dir,
+        )
 
     # Step 2: tdr → DF-ISE  (tdx writes output relative to its CWD)
     _run_tdx(
-        ["--tdr2dfise", str(trad_tdr), output_base],
+        ["--tdr2dfise", str(trad_tdr if traditional else tdr_path), output_base],
         cwd=output_dir,
     )
 
@@ -103,16 +108,20 @@ def convert_tdr_to_dfise(
 # 2. DF-ISE .grd / .dat shared helpers
 # =========================================================================
 
+_BRACES = re.compile(r"[{}]")
+
+
 def _find_matching_brace(text: str, open_pos: int) -> int:
-    """Return index of the closing '}' matching the '{' at *open_pos*."""
+    """Return index of the closing '}' matching the '{' at *open_pos*. Scans brace characters only (the Values
+    blocks between them are megabytes of numbers; a per-character loop made this the parsers' main cost)."""
     depth = 0
-    for i in range(open_pos, len(text)):
-        if text[i] == '{':
+    for m in _BRACES.finditer(text, open_pos):
+        if m.group() == '{':
             depth += 1
-        elif text[i] == '}':
+        else:
             depth -= 1
             if depth == 0:
-                return i
+                return m.start()
     return -1
 
 
@@ -557,6 +566,7 @@ def extract_solution(
     tdr_path: Path,
     mesh: DFISEMesh,
     cache_dir: Optional[Path] = None,
+    traditional: bool = True,
 ) -> Dict[str, np.ndarray]:
     """Extract solution fields from a single solution TDR.
 
@@ -565,6 +575,7 @@ def extract_solution(
     tdr_path : absolute path to the solution .tdr file
     mesh : already-parsed DFISEMesh (shared across snapshots)
     cache_dir : if given, store DF-ISE intermediates here
+    traditional : see convert_tdr_to_dfise (False for sdevice plots on a DF-ISE round-tripped grid)
     """
     tdr_path = Path(tdr_path).resolve()
     cleanup = cache_dir is None
@@ -576,7 +587,7 @@ def extract_solution(
 
     try:
         _, sol_dat = convert_tdr_to_dfise(
-            tdr_path, work_dir, tdr_path.stem
+            tdr_path, work_dir, tdr_path.stem, traditional=traditional
         )
         sol_datasets = parse_dat(sol_dat)
         return collect_node_fields(sol_datasets, mesh)

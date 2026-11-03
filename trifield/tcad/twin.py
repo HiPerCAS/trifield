@@ -122,12 +122,17 @@ def electrode_fermi_levels(mesh, vg: float, vd: float, vs: float = 0.0):
 # DF-ISE helpers
 # ---------------------------------------------------------------------------
 
+_BRACES = re.compile(r"[{}]")
+
+
 def _match_brace(s: str, i: int) -> int:
+    """Index of the '}' closing the '{' at i (scans brace characters only: a per-character loop over the Values
+    blocks cost ~1 s per guess written on a 13k-vertex mesh)."""
     depth = 0
-    for j in range(i, len(s)):
-        depth += (s[j] == "{") - (s[j] == "}")
+    for m in _BRACES.finditer(s, i):
+        depth += 1 if m.group() == "{" else -1
         if depth == 0:
-            return j
+            return m.start()
     return -1
 
 
@@ -413,7 +418,7 @@ class Twin:
             tmpl = next(iter(sorted(work.glob("tmpl*_des.tdr"))), None)
             if tmpl is None:
                 raise RuntimeError(f"template dump failed, see {work / 'tmpl.out'}")
-            self.template_grd, self.template_dat = convert_tdr_to_dfise(tmpl, work, "tmpl")
+            self.template_grd, self.template_dat = convert_tdr_to_dfise(tmpl, work, "tmpl", traditional=False)
         self.timing["prepare"] = time.monotonic() - t0
         if physics is not None:
             physics.join()
@@ -828,7 +833,7 @@ class Twin:
         tdr = self.run_dir / "twin" / f"{r['plot']}_des.tdr"
         if not tdr.exists():
             return None
-        sol = extract_solution(tdr, self.mesh)
+        sol = extract_solution(tdr, self.mesh, traditional=False)
         return {k: np.asarray(sol[k], float) for k in FIELD_FUNCS}
 
     def vth_search_ladder2(self, vg11: float, i_on: float | None, tol_log: float = 0.01, max_evals: int = 8,

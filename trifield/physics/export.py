@@ -64,7 +64,7 @@ def export_mesh_data(work: Path, base_deck: str, grid: str = "grid_des.tdr", dfi
         raise RuntimeError(f"box-coefficient export failed, see {box / 'box.out'}")
     if not (const / "const_des.tdr").exists():
         raise RuntimeError(f"constants export failed, see {const / 'const.out'}")
-    _, dat = convert_tdr_to_dfise(const / "const_des.tdr", const, "const")
+    _, dat = convert_tdr_to_dfise(const / "const_des.tdr", const, "const", traditional=False)
     md = MeshData(work / grid, work / dfise_grd, box / "MeasureCoefficientsDebug", dat, physics)
     cache.write_bytes(pickle.dumps(md))
     return md
@@ -82,7 +82,7 @@ def trap_factors(md, plot_tdr: Path, work: Path):
     import torch
     from trifield.data.tdr_extract import collect_node_fields, convert_tdr_to_dfise, parse_dat, parse_grd
     from trifield.physics.equations import DT, Equations
-    grd, dat = convert_tdr_to_dfise(Path(plot_tdr), Path(work), "trapcal")
+    grd, dat = convert_tdr_to_dfise(Path(plot_tdr), Path(work), "trapcal", traditional=False)
     g = parse_grd(grd); ds = parse_dat(dat); mat = dict(zip(g.region_names, g.region_materials))
     ntc = np.zeros(md.n)
     for x in ds:
