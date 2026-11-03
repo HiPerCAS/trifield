@@ -95,6 +95,7 @@ def run_design(task) -> list[dict]:
             if twin_wall:
                 rec["speedup_wall"] = rec["prod_sdevice_wall"] / twin_wall
                 rec["speedup_cpu"] = rec["prod_sdevice_cpu"] / max(rec.get("sdevice_cpu_sum", 0)
+                                                                   + rec.get("t_server_cpu_overhead", 0)
                                                                    + rec.get("t_predict", 0)
                                                                    + rec.get("t_prepare", 0)
                                                                    + rec.get("t_guess", 0)

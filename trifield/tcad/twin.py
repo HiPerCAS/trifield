@@ -39,12 +39,15 @@ import re
 import shutil
 import threading
 import time
+import weakref
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
 from trifield.params import FIXED, SFIN, area_factor
+from trifield.tcad.server import SdeviceServer, ServerPool, server_deck, warm_request
 from trifield.tcad.simulation import (SDE_CMD, SDE_TEMPLATE, TEMPLATE_DIR, PLTFile,
                                       SimulationParams, find_parameter_file, render_template,
                                       run_timed)
@@ -247,6 +250,11 @@ def warm_solve(prefix: str, iterations: int = 40) -> str:
     return f'\tLoad(FilePrefix= "{prefix}")\n\tCoupled(Iterations= {iterations}){{ Poisson Electron Hole }}'
 
 
+# A plain warm start (Load the guess, Newton at the target bias): `warm_solve` as a deck of its own, or one request to a
+# persistent sdevice server (trifield.tcad.server) - same Newton iterations, same result.
+WarmStart = namedtuple("WarmStart", "prefix iterations")
+
+
 def warm_two_stage(prefix: str, iterations: int = 40) -> str:
     """Newton on (psi, n) with the guess's holes held, then on the full system (deep off-state, see
     `Twin.hole_stage`): the hole inversion layer under the gate re-forms in the second stage."""
@@ -309,8 +317,22 @@ class Twin:
                  trap_calibration: bool = True, ramp_race: tuple | None = (1.0, 2.0), nbguess_dv: float = 1.0,
                  hole_stage: bool = True, vth_floor: float = -6.0, warm_refine: dict | None = WARM_REFINE,
                  warm_refine_neg: dict | None = WARM_REFINE_NEG, trap_overlap: bool = True,
-                 refine_threads: int | None = 4):
+                 refine_threads: int | None = 4, servers: int | None = None, server_threads: int = 1,
+                 server_plots: bool = True):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
+        # warm mode: plain warm starts (direct, nbguess, escalated) run in persistent `sdevice --tcl` processes
+        # (trifield.tcad.server) that initialise the device once, instead of one sdevice process per solve. Per
+        # process that saves the binary start and licence checkout (~0.9 s) and the device initialisation (1.2 s at
+        # 3k vertices, 5.6 s at 13k); results are identical. servers: number of processes (None = min(max_parallel,
+        # 2): the serialised GPU refinements stagger the points, so a third server rarely has work; each one holds a
+        # licence), 0 = one process per solve; server_threads: their --threads; server_plots: write each converged
+        # solve's plot TDR (neighbour guesses, labels). Races, ramps and cold solves keep their own processes.
+        self.servers = servers
+        self.server_threads = server_threads
+        self.server_plots = server_plots
+        self._pool = None
+        self._pool_final = None
+        self._server_cpu_served = 0.0
         self.run_dir = Path(run_dir)
         self.models = models
         self.mode = mode
@@ -444,12 +466,14 @@ class Twin:
             physics.start()
         if self.mode == "warm":
             # a zero-iteration run writes a TDR with the exact per-region dataset
-            # layout sdevice expects to Load; its values are overwritten later
-            deck = make_deck(self.base, "tmpl", 0.0, 0.0,
-                             "\tCoupled(Iterations= 0){ Poisson Electron Hole }\n\tPlot(FilePrefix= \"tmpl\")",
-                             grid=GRID, math_extra="RHSMin= 1e30")
-            (work / "tmpl.cmd").write_text(deck)
-            run_timed(SDEVICE + ["tmpl.cmd"], work, 600, work / "tmpl.out", work / "tmpl.err", check=False)
+            # layout sdevice expects to Load; its values are overwritten later. With servers the first
+            # one writes it: the plot of a freshly initialised device has the same layout.
+            if not self._start_servers():
+                deck = make_deck(self.base, "tmpl", 0.0, 0.0,
+                                 "\tCoupled(Iterations= 0){ Poisson Electron Hole }\n\tPlot(FilePrefix= \"tmpl\")",
+                                 grid=GRID, math_extra="RHSMin= 1e30")
+                (work / "tmpl.cmd").write_text(deck)
+                run_timed(SDEVICE + ["tmpl.cmd"], work, 600, work / "tmpl.out", work / "tmpl.err", check=False)
             tmpl = next(iter(sorted(work.glob("tmpl*_des.tdr"))), None)
             if tmpl is None:
                 raise RuntimeError(f"template dump failed, see {work / 'tmpl.out'}")
@@ -471,6 +495,73 @@ class Twin:
                     self._trap_thread.start()
                 else:
                     self.calibrate_traps()
+
+    def _start_servers(self) -> bool:
+        """Start the persistent sdevice processes and have the first one write the template (tmpl_des.tdr).
+        False (and no servers) when disabled or when the first one cannot write it."""
+        n = min(self.max_parallel, 2) if self.servers is None else int(self.servers)
+        if self.mode != "warm" or n <= 0:
+            return False
+        t0 = time.monotonic()
+        work = self.run_dir / "twin"
+        deck = make_deck(self.base, "srv", 0.0, 0.0, "", grid=GRID)
+        srv = [SdeviceServer(work, server_deck(deck, output=f"srv{k}_des.log"), f"srv{k}", self.server_threads).start()
+               for k in range(n)]
+        pool = ServerPool(srv)
+        self._pool_final = weakref.finalize(self, pool.close)          # also on garbage collection / exit
+        for s in srv[1:]:                    # initialise the others' devices meanwhile (empty Solve section)
+            threading.Thread(target=s.solve, args=(f"{s.name}_init", "", False), daemon=True).start()
+        r = srv[0].solve("tmpl", '\tPlot(FilePrefix= "tmpl")', plot=False)
+        if r is None or not (work / "tmpl_des.tdr").exists():
+            log.warning("sdevice server did not start (see %s); one sdevice process per solve", work / "srv0.out")
+            pool.close()
+            self._pool_final.detach()
+            return False
+        self._pool = pool
+        self.timing["server_template"] = time.monotonic() - t0
+        return True
+
+    def close(self) -> None:
+        """Stop the sdevice servers (run() does this at the end; callers of solve_point should)."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            cpu = pool.close()
+            # CPU of the servers outside the solves they answered (start, device init, template, idle waits)
+            self.timing["server_cpu_overhead"] = max(cpu - self._server_cpu_served, 0.0)
+            if self._pool_final is not None:
+                self._pool_final.detach()
+
+    def _solve_warm(self, tag: str, ws: WarmStart, vg: float, vd: float) -> tuple[float | None, dict]:
+        """One plain warm start: by a server when one is alive, else as its own sdevice process (also when the
+        server goes down during the request)."""
+        t0 = time.monotonic()
+        srv = self._pool.acquire() if self._pool is not None else None
+        if srv is not None:
+            wait = time.monotonic() - t0
+            try:
+                r = srv.solve(tag, warm_request(ws.prefix, vg, vd, ws.iterations), plot=self.server_plots)
+            finally:
+                self._pool.release(srv)
+            if r is not None:
+                plt, t = r
+                t["server_wait"] = wait                         # not in "wall" (sdevice time, as per-point runs)
+                work = self.run_dir / "twin"
+                out = (work / f"{tag}.out").read_text(errors="replace") if (work / f"{tag}.out").exists() else ""
+                t["newton"] = len(re.findall(r"^\s*(\d+)\s+[-\d.]+e[+-]\d+", out, re.MULTILINE))
+                cur = None
+                if plt.exists():
+                    try:
+                        cur = abs(float(PLTFile(plt).columns["d_total_current"][-1]))
+                        cur = cur if math.isfinite(cur) else None
+                    except Exception:                          # noqa: broad-except
+                        cur = None
+                t["returncode"] = 0 if cur is not None else 1
+                t["server"] = srv.name
+                with self._lock:
+                    self._server_cpu_served += t["cpu"]
+                return cur, t
+        deck = make_deck(self.base, tag, vg, vd, warm_solve(ws.prefix, ws.iterations), grid=GRID)
+        return self._sdevice(tag, deck)
 
     def calibrate_traps(self) -> None:
         """Sentaurus' per-vertex interface-trap density from one 0-iteration plot of a state with every donor trap
@@ -762,7 +853,7 @@ class Twin:
                     fields = self.with_metal_state(fields, vg, vd)
                 self.write_guess(fields, f"g{tag}", vg, vd)
                 if "direct" in self.warm_recipes:
-                    recipes.append(("direct", vg, vd, warm_solve(f"g{tag}", self.warm_iterations)))
+                    recipes.append(("direct", vg, vd, WarmStart(f"g{tag}", self.warm_iterations)))
                 if "poisson_first" in self.warm_recipes:
                     recipes.append(("poisson_first", vg, vd, warm_poisson_first(f"g{tag}")))
                 if "drain_ramp" in self.warm_recipes and vd > 0:
@@ -785,22 +876,22 @@ class Twin:
         if (fallbacks and self.mode == "warm" and refine and self.solver_escalate is not None and refine_info
                 and not refine_info.get("converged") and "error" not in refine_info):
             recipes.insert(len(recipes) - (recipes[-1][0] == "cold"), ("escalated", vg, vd, None))
-        cur, total_wall, total_cpu, newton, used = None, 0.0, 0.0, 0, None
+        cur, total_wall, total_cpu, newton, used, served = None, 0.0, 0.0, 0, None, None
         for i, (name, ev_g, ev_d, solve) in enumerate(recipes):
             if name == "nbguess":
                 nbf = self._neighbour_fields(vg, vd, max_dv=self.nbguess_dv)
                 if nbf is None:
                     continue
                 self.write_guess(self.with_metal_state(nbf, vg, vd), f"g{tag}n", vg, vd)
-                solve = warm_solve(f"g{tag}n", self.warm_iterations)
+                solve = WarmStart(f"g{tag}n", self.warm_iterations)
                 if self.hole_stage and vg < 0 < vd:
                     semi = self.solver.md.semi
                     strip = {**nbf, FIELD_FUNCS[2]: np.where(semi, nbf[FIELD_FUNCS[1]], nbf[FIELD_FUNCS[2]])}
                     self.write_guess(self.with_metal_state(strip, vg, vd), f"g{tag}h", vg, vd)
-                    solve = (solve, warm_two_stage(f"g{tag}n", self.warm_iterations),
+                    solve = (warm_solve(*solve), warm_two_stage(f"g{tag}n", self.warm_iterations),
                              warm_two_stage(f"g{tag}h", self.warm_iterations))
                 recipes[i] = (name, ev_g, ev_d, solve)
-            if isinstance(solve, tuple):                      # raced decks: ramp step sizes, or one- vs two-stage nbguess
+            if isinstance(solve, tuple) and not isinstance(solve, WarmStart):   # raced decks: ramp step sizes, or one- vs two-stage nbguess
                 base_tag = f"{tag}{chr(97 + i)}"
                 entries = [(base_tag if k == 0 else f"{base_tag}r{k}", make_deck(self.base, base_tag if k == 0 else f"{base_tag}r{k}",
                                                                                   ev_g, ev_d, sv, grid=GRID)) for k, sv in enumerate(solve)]
@@ -825,13 +916,18 @@ class Twin:
                 except Exception as exc:                                  # noqa: broad-except
                     log.warning("escalation failed at Vg=%.3f Vd=%.3f (%s)", vg, vd, exc)
                     continue
-                solve = warm_solve(f"g{tag}e", self.warm_iterations)
+                solve = WarmStart(f"g{tag}e", self.warm_iterations)
                 recipes[i] = (name, ev_g, ev_d, solve)
-            deck = make_deck(self.base, f"{tag}{chr(97 + i)}", ev_g, ev_d, solve, grid=GRID)
-            cur, t = self._sdevice(f"{tag}{chr(97 + i)}", deck)
+            if isinstance(solve, WarmStart):
+                cur, t = self._solve_warm(f"{tag}{chr(97 + i)}", solve, ev_g, ev_d)
+            else:
+                deck = make_deck(self.base, f"{tag}{chr(97 + i)}", ev_g, ev_d, solve, grid=GRID)
+                cur, t = self._sdevice(f"{tag}{chr(97 + i)}", deck)
             total_wall += t["wall"]
             total_cpu += t["cpu"]
             newton += t["newton"]
+            if t.get("server"):
+                served = t["server"]
             if cur is not None:
                 used = name
                 break
@@ -841,6 +937,8 @@ class Twin:
                "refine": refine_info if self.mode == "warm" else None,
                "recipe": used, "attempts": recipes.index(next(r for r in recipes if r[0] == used)) + 1
                if used else len(recipes), "newton": newton, "wall": total_wall, "cpu": total_cpu}
+        if served:
+            row["server"] = served
         with self._lock:
             self.log.append(row)
         return cur
@@ -1011,6 +1109,12 @@ class Twin:
 
     def run(self) -> dict:
         t0 = time.monotonic()
+        try:
+            return self._run(t0)
+        finally:
+            self.close()
+
+    def _run(self, t0: float) -> dict:
         self.mesh_design()
         self.prepare()
         vg11 = float(self.params.Vg11)
@@ -1035,6 +1139,7 @@ class Twin:
             vth = self.vth_search(vg11, i_on)
         if self._trap_thread is not None:
             self._trap_thread.join()
+        self.close()                                       # its time counts (servers stop in ~0.1-0.5 s)
         wall = time.monotonic() - t0
         solves = self.log
         return {
