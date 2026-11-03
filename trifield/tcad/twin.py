@@ -54,8 +54,21 @@ log = logging.getLogger("trifield.tcad.twin")
 FIELD_FUNCS = ("ElectrostaticPotential", "eQuasiFermiPotential", "hQuasiFermiPotential")
 SDEVICE = ["sdevice", "-q", "-n", "--threads", "1"]
 VTH_TARGET = 1.0            # mA/mm, same criterion as the production find_vth
+LADDER_STEP = 0.5           # gate step of the Vth ladder (vth_search_ladder2)
 VD_HIGH, VD_LIN = 12.0, 3.0
 GRID = "grid_des.tdr"        # DF-ISE round-tripped mesh the twin solves on
+# RefineConfig overrides for the refinement of a warm-start guess (solve_point), by gate bias. Sentaurus only needs the
+# guess in its convergence basin: from a joint-Newton merit of 1e-3 it takes the same number of Newton steps as from 1e-9
+# (5-7), while the default schedule (25 Gummel sweeps with fully converged Poisson solves, then Newton to 1e-9) spends most
+# of its time on accuracy Sentaurus does not use. The Gummel sweeps are still needed: from the raw guess a few low-density
+# buffer vertices get Newton components of 1e5-1e9 V and throttle every step through the clip. At Vg >= 0, 12 sweeps with
+# 2 Poisson-Newton steps each remove them as reliably as 25 x 50 (same Sentaurus counts on 8 e-mode + 3 d-mode designs).
+# At Vg < 0 they do not: below threshold the cheap sweeps can lead the Newton to a state (the floating hole layer under the
+# gate) from which Sentaurus needs 8-23 instead of 5 steps even at merit 3e-7, so there only the tolerance is loosened.
+# refine_fields() (screening: refined currents) and the escalation keep their configs: at merit 1e-3 the refined current is
+# only good to ~10%.
+WARM_REFINE = {"newton_tol": 1e-3, "converged_tol": 1e-3, "gummel_iters": 12, "gummel_poisson_maxit": 2}
+WARM_REFINE_NEG = {"newton_tol": 1e-3, "converged_tol": 1e-3}
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +304,10 @@ class Twin:
                  gate_uncertainty: float | None = None, refine: bool = True, refine_device: str = "cpu",
                  anchor_before_refine: bool = False, refine_config=None, feature_version: int | None = None,
                  cold_fallback: bool = True, refine_escalate=None, neighbour_ramp: bool = True,
-                 metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 10000,
+                 metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 4000,
                  trap_calibration: bool = True, ramp_race: tuple | None = (1.0, 2.0), nbguess_dv: float = 1.0,
-                 hole_stage: bool = True, vth_floor: float = -6.0):
+                 hole_stage: bool = True, vth_floor: float = -6.0, warm_refine: dict | None = WARM_REFINE,
+                 warm_refine_neg: dict | None = WARM_REFINE_NEG, trap_overlap: bool = True):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -308,6 +322,9 @@ class Twin:
         self.refine_device = refine_device
         self.anchor_before_refine = anchor_before_refine
         self.refine_config = refine_config
+        # RefineConfig overrides for warm-start refinements (solve_point) at Vg >= 0 / Vg < 0; None = refine_config as is
+        self.warm_refine = dict(warm_refine) if warm_refine else None
+        self.warm_refine_neg = dict(warm_refine_neg) if warm_refine_neg else None
         # graph feature version the checkpoints were trained on (None = graph_builder default, v2;
         # pass 3 for checkpoints trained on v3 graphs)
         self.feature_version = feature_version
@@ -343,11 +360,22 @@ class Twin:
         # result carries vth=None, vth_below_floor=True. vth_floor=0 screens for enhancement mode: a device that
         # conducts at Vg = 0 is reported as d-mode without solving any negative gate bias.
         self.vth_floor = float(vth_floor)
-        # refine_device="auto": SuperLU on the CPU for small meshes (cuDSS is overhead-bound there: 14 s vs ~11-106 s
-        # at 3k nodes), cuDSS on the GPU above `refine_cpu_below` vertices (17x faster at 25k nodes)
+        # refine_device="auto": SuperLU on the CPU for small meshes, cuDSS on the GPU above `refine_cpu_below` vertices.
+        # With the warm-start schedule the GPU refinement is 1.6x (3.2k vertices), 2.9x (5.6k) and 3.5-3.8x (8.1-8.6k)
+        # faster than the CPU one (was 10k when the GPU path was overhead-bound). The same size decides ladder3's
+        # secant guesses (neighbour solution on small meshes, surrogate + refinement above).
         self.refine_cpu_below = refine_cpu_below
         # per-vertex interface-trap density from one 0-iteration Sentaurus plot (calibrate_traps)
         self.trap_calibration = trap_calibration
+        # run an uncached calibration in the background: the on-state points (Vg = Vg11; insensitive to the trap
+        # density: same Sentaurus Newton counts with and without it on 16/16 e-mode points) refine and solve
+        # meanwhile, every other refinement waits for the factors. They are applied when no refinement is running.
+        self.trap_overlap = trap_overlap
+        self._traps_ready = threading.Event()
+        self._traps_ready.set()
+        self._trap_thread = None
+        self._trap_cv = threading.Condition()
+        self._refining = 0
         self._md = None
         self.solver_escalate = None
         self.solver = None
@@ -423,7 +451,19 @@ class Twin:
         if physics is not None:
             physics.join()
             if self.trap_calibration:
-                self.calibrate_traps()
+                cached = (self.run_dir / "twin" / "physics" / "trap_factors.pkl").exists()
+                if self.trap_overlap and not cached and self.solver is not None:
+                    self._traps_ready.clear()
+
+                    def calibrate():
+                        try:
+                            self.calibrate_traps()
+                        finally:
+                            self._traps_ready.set()
+                    self._trap_thread = threading.Thread(target=calibrate, daemon=True)
+                    self._trap_thread.start()
+                else:
+                    self.calibrate_traps()
 
     def calibrate_traps(self) -> None:
         """Sentaurus' per-vertex interface-trap density from one 0-iteration plot of a state with every donor trap
@@ -457,9 +497,12 @@ class Twin:
         except Exception as exc:                                          # noqa: broad-except
             log.warning("trap calibration failed (%s); using the geometric trap density", exc)
             return
-        for s in (self.solver, self.solver_escalate):
-            if s is not None:
-                s.set_trap_factors(factors)
+        with self._trap_cv:                          # never swap the trap density under a running refinement
+            while self._refining:
+                self._trap_cv.wait()
+            for s in (self.solver, self.solver_escalate):
+                if s is not None:
+                    s.set_trap_factors(factors)
         self.timing["trap_calibration"] = time.monotonic() - t0
 
     def prepare_physics(self) -> None:
@@ -482,20 +525,31 @@ class Twin:
             self.solver = None
         self.timing["physics_export"] = time.monotonic() - t0
 
-    def refine_fields(self, fields: dict, vg: float, vd: float, solver=None) -> tuple[dict, dict]:
-        """Surrogate fields -> refined fields on the exact discrete equations (+ diagnostics)."""
+    def refine_fields(self, fields: dict, vg: float, vd: float, solver=None, config=None,
+                      wait_traps: bool = True) -> tuple[dict, dict]:
+        """Surrogate fields -> refined fields on the exact discrete equations (+ diagnostics). `config`: RefineConfig
+        overrides for this call (solve_point passes warm_refine). wait_traps=False: do not wait for a background trap
+        calibration (on-state points)."""
         solver = solver or self.solver
         guess = np.stack([np.asarray(fields[k], float) for k in FIELD_FUNCS], 1)
+        if wait_traps:
+            self._traps_ready.wait()
+        with self._trap_cv:
+            self._refining += 1
         t0 = time.monotonic()
         try:
             if solver.bk.gpu:
                 with self._refine_lock:
-                    res = solver.refine(guess, vg, vd)
+                    res = solver.refine(guess, vg, vd, config)
             else:
-                res = solver.refine(guess, vg, vd)
+                res = solver.refine(guess, vg, vd, config)
         except Exception as exc:                                          # noqa: broad-except
             log.warning("refinement failed at Vg=%.3f Vd=%.3f (%s); using the raw guess", vg, vd, exc)
             return fields, {"error": str(exc)}
+        finally:
+            with self._trap_cv:
+                self._refining -= 1
+                self._trap_cv.notify_all()
         dt = time.monotonic() - t0
         with self._lock:
             self.timing["refine"] += dt
@@ -677,7 +731,9 @@ class Twin:
                 unc = getattr(self, "last_uncertainty", None)
             refine_info = None
             if refine and self.solver is not None:
-                fields, refine_info = self.refine_fields(fields, vg, vd)
+                on_state = abs(vg - float(self.params.Vg11)) < 1e-9
+                fields, refine_info = self.refine_fields(fields, vg, vd, wait_traps=not on_state,
+                                                         config=self.warm_refine if vg >= 0 else self.warm_refine_neg)
             gated = (self.gate_uncertainty is not None and unc is not None and unc > self.gate_uncertainty)
             if not gated:
                 # the metal drop follows the current the guess carries: trust it after a converged refinement
@@ -837,7 +893,7 @@ class Twin:
         return {k: np.asarray(sol[k], float) for k in FIELD_FUNCS}
 
     def vth_search_ladder2(self, vg11: float, i_on: float | None, tol_log: float = 0.01, max_evals: int = 8,
-                           prefetched: dict | None = None, step: float = 0.5, from_neighbours: bool = False) -> float | None:
+                           prefetched: dict | None = None, step: float = LADDER_STEP, from_neighbours: bool = False) -> float | None:
         """Vth on Sentaurus currents (same criterion and tolerance as `vth_search`). From the 0 V point step
         down (device on at 0 V) or up (off at 0 V) in `step` volts until the current crosses 1 mA/mm, so the
         bracket is tight and near threshold - where log Id is nearly linear in Vg and every warm start is easy -
@@ -939,18 +995,27 @@ class Twin:
         self.mesh_design()
         self.prepare()
         vg11 = float(self.params.Vg11)
-        prefetch = self.vth_mode != "legacy" and self.max_parallel >= 3 and vg11 > 0
+        # the ladder's first points are known in advance: the 0 V point always, and for an e-mode screen
+        # (vth_floor >= 0, where a device that is on at 0 V needs no further point) the first step up, which every
+        # device that is off at 0 V needs. They queue behind the on-state points and start as soon as a worker is free
+        # (with max_parallel 2 the 0 V point used to wait for both on-state solves).
+        ladder = self.vth_mode in ("ladder2", "ladder3") and vg11 > 0
+        prefetch = [0.0] if ladder and self.max_parallel >= 2 else []
+        if prefetch and self.vth_floor >= 0 and vg11 > LADDER_STEP:
+            prefetch.append(LADDER_STEP)
         with ThreadPoolExecutor(max_workers=self.max_parallel) as pool:
             f_on = pool.submit(self.solve_point, vg11, VD_HIGH)
             f_lin = pool.submit(self.solve_point, vg11, VD_LIN)
-            f_zero = pool.submit(self.solve_point, 0.0, VD_HIGH) if prefetch else None
+            f_pre = {v: pool.submit(self.solve_point, v, VD_HIGH) for v in prefetch}
             i_on = f_on.result()
             i_lin = f_lin.result()
-            pre = {0.0: f_zero.result()} if f_zero is not None else {}
+            pre = {v: f.result() for v, f in f_pre.items()}
         if self.vth_mode in ("ladder2", "ladder3"):
             vth = self.vth_search_ladder2(vg11, i_on, prefetched=pre, from_neighbours=self.vth_mode == "ladder3")
         else:
             vth = self.vth_search(vg11, i_on)
+        if self._trap_thread is not None:
+            self._trap_thread.join()
         wall = time.monotonic() - t0
         solves = self.log
         return {
@@ -981,7 +1046,7 @@ def main(argv=None):
     ap.add_argument("--mode", choices=["warm", "cold"], default="warm")
     ap.add_argument("--device", default="auto", help="surrogate device")
     ap.add_argument("--refine_device", default="auto", help="physics refinement device; auto = CPU (SuperLU) below "
-                    "10k vertices, GPU (cuDSS, ~17x faster at 25k nodes) above")
+                    "4k vertices, GPU (cuDSS) above")
     ap.add_argument("--refine_cap", type=int, default=30, help="refinement Newton budget before Sentaurus "
                     "(0 = full RefineConfig); escalation continues to the full budget if Sentaurus fails")
     ap.add_argument("--no_escalate", action="store_true")
