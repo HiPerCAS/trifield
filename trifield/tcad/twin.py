@@ -308,7 +308,8 @@ class Twin:
                  metal_state: bool = True, vth_mode: str = "ladder3", refine_cpu_below: int = 4000,
                  trap_calibration: bool = True, ramp_race: tuple | None = (1.0, 2.0), nbguess_dv: float = 1.0,
                  hole_stage: bool = True, vth_floor: float = -6.0, warm_refine: dict | None = WARM_REFINE,
-                 warm_refine_neg: dict | None = WARM_REFINE_NEG, trap_overlap: bool = True):
+                 warm_refine_neg: dict | None = WARM_REFINE_NEG, trap_overlap: bool = True,
+                 refine_threads: int | None = 4):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         self.run_dir = Path(run_dir)
         self.models = models
@@ -366,6 +367,11 @@ class Twin:
         # faster than the CPU one (was 10k when the GPU path was overhead-bound). The same size decides ladder3's
         # secant guesses (neighbour solution on small meshes, surrogate + refinement above).
         self.refine_cpu_below = refine_cpu_below
+        # CPU refinement: cap torch's intra-op threads (process wide). The twin runs up to max_parallel refinements at
+        # once; with torch's default (one thread per core) two concurrent refinements on a shared 32-core host took
+        # 15-156 s instead of ~2 s (OpenMP pools oversubscribed). 1-4 threads are as fast as 32 for one refinement on
+        # these meshes. None = leave torch's setting.
+        self.refine_threads = refine_threads
         # per-vertex interface-trap density from one 0-iteration Sentaurus plot (calibrate_traps)
         self.trap_calibration = trap_calibration
         # run an uncached calibration in the background: the on-state points (Vg = Vg11; insensitive to the trap
@@ -518,6 +524,10 @@ class Twin:
                 import torch
                 self.refine_device = ("cpu" if md.n < self.refine_cpu_below or not torch.cuda.is_available()
                                       else "cuda")
+            if str(self.refine_device).startswith("cpu") and self.refine_threads:
+                import torch
+                if torch.get_num_threads() > self.refine_threads:
+                    torch.set_num_threads(self.refine_threads)
             self.solver = Solver(md, self.refine_device, self.refine_config or RefineConfig())
             if self.refine_escalate is not None:
                 self.solver_escalate = Solver(md, self.refine_device, self.refine_escalate)
