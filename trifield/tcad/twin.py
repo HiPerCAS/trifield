@@ -192,6 +192,30 @@ def _rewrite_dat(src: Path, dst: Path, mesh=None, fields: dict | None = None, on
     dst.write_text("DF-ISE text\n\nInfo {" + info + "}\n\nData {\n\n" + "\n\n".join(keep) + "\n\n}\n")
 
 
+def _guess_dat(dst: Path, mesh, info: str, fields: dict) -> None:
+    """DF-ISE .dat of a guess written from the mesh alone: GUESS_DATASETS on every bulk region (all regions but
+    interfaces and contacts: the layout of this deck's Sentaurus plots, checked against the sdevice template on 21
+    meshes), values ``fields[name][region_vertex_indices[region]]`` formatted as `_rewrite_dat` does, lattice
+    temperature 300 K. ``info``: the Info block of the mesh's own DF-ISE .dat (grid counts). Converted with the
+    mesh's .grd it loads on the round-tripped grid exactly like a guess written from the template (same currents
+    and Newton residual histories), without the template's sdevice run and its DF-ISE conversion."""
+    blocks, names = [], []
+    for name in GUESS_DATASETS:
+        for reg, mat in zip(mesh.region_names, mesh.region_materials):
+            vidx = mesh.region_vertex_indices.get(reg)
+            if mat in ("Interface", "Contact") or vidx is None or not len(vidx):
+                continue
+            vals = np.full(len(vidx), 300.0) if name == "LatticeTemperature" else np.asarray(fields[name], float)[vidx]
+            body = " " + " ".join(f"{v:.15e}" for v in vals) + "\n    "
+            blocks.append(f'Dataset ("{name}") {{\n    function  = {name}\n    type      = scalar\n    dimension = 1\n'
+                          f'    location  = vertex\n    validity  = [ "{reg}" ]\n    Values ({len(vidx)}) {{{body}}}\n  }}')
+            names.append(name)
+    info = re.sub(r"datasets\s*=\s*\[.*?\]", "datasets    = [ " + " ".join(f'"{n}"' for n in names) + " ]", info,
+                  flags=re.DOTALL)
+    info = re.sub(r"functions\s*=\s*\[.*?\]", "functions   = [ " + " ".join(names) + " ]", info, flags=re.DOTALL)
+    dst.write_text("DF-ISE text\n\nInfo {" + info + "}\n\nData {\n\n" + "\n\n".join(blocks) + "\n\n}\n")
+
+
 def _tdx(args: list[str], cwd: Path) -> None:
     from trifield.data.tdr_extract import find_tdx
     import subprocess
@@ -324,7 +348,7 @@ class Twin:
                  hole_stage: bool = True, vth_floor: float = -6.0, warm_refine: dict | None = WARM_REFINE,
                  warm_refine_neg: dict | None = WARM_REFINE_NEG, trap_overlap: bool = True,
                  refine_threads: int | None = 4, servers: int | None = None, server_threads: int = 1,
-                 server_plots: bool = True):
+                 server_plots: bool = True, guess_layout: str = "mesh"):
         self.params = params if isinstance(params, SimulationParams) else SimulationParams.from_dict(params)
         # warm mode: plain warm starts (direct, nbguess, escalated) run in persistent `sdevice --tcl` processes
         # (trifield.tcad.server) that initialise the device once, instead of one sdevice process per solve. Per
@@ -336,6 +360,10 @@ class Twin:
         self.servers = servers
         self.server_threads = server_threads
         self.server_plots = server_plots
+        # guess TDRs: "mesh" = written from the mesh's DF-ISE (`_guess_dat`, no template needed), "template" = from
+        # the dataset layout of a zero-iteration sdevice plot (the template; previous behaviour)
+        self.guess_layout = guess_layout
+        self._mesh_info = None
         self._pool = None
         self._pool_final = None
         self._server_cpu_served = 0.0
@@ -449,7 +477,7 @@ class Twin:
         mesh is parsed and the per-mesh physics is ready and write the template in the background (write_guess waits
         for it), so that the first points' predictions and refinements overlap with the template's sdevice run."""
         from trifield.data.tdr_extract import convert_tdr_to_dfise, parse_dat, parse_grd, collect_node_fields
-        t0 = time.monotonic()
+        t0 = self._t_prepare = time.monotonic()
         work = self.run_dir / "twin"
         work.mkdir(exist_ok=True)
         par = find_parameter_file(self.par_file) if self.par_file or not (self.run_dir / "parameter.par").exists() \
@@ -458,11 +486,6 @@ class Twin:
             shutil.copy(par, work / "parameter.par")
         shutil.copy(self.run_dir / "node_msh.tdr", work / "node_msh.tdr")
         grd, dat = convert_tdr_to_dfise(work / "node_msh.tdr", work, "msh")
-        self.mesh = parse_grd(grd)
-        _mds = parse_dat(dat)
-        self.mesh_fields = collect_node_fields(_mds, self.mesh)
-        from trifield.data.tdr_extract import collect_region_fields
-        self.mesh.region_fields = collect_region_fields(_mds, self.mesh)
         # Solve on the DF-ISE round-tripped mesh: a guess written through DF-ISE only
         # loads on a grid that went through the same conversion (Sentaurus compares
         # the geometry byte-for-byte). Validated: identical terminal currents to the
@@ -471,18 +494,28 @@ class Twin:
         _tdx(["--dfise2tdr", grd.name, "msh_clean.dat", GRID], work)
         if not (work / GRID).exists():
             raise RuntimeError("grid conversion failed")
+        if self.mode == "warm":
+            # sdevice servers (device initialisation) and, for guess_layout "template", the template: in the background
+            self._template_ready.clear()
+            self._template_thread = threading.Thread(target=self._make_template, args=(t0,), daemon=True)
+            self._template_thread.start()
         physics = None
         if self.mode == "warm" and (self.refine or self.metal_state):
             # the per-mesh exports are independent sdevice runs: overlap them with the template run
             physics = threading.Thread(target=self.prepare_physics, daemon=True)
             physics.start()
+        self.mesh = parse_grd(grd)
+        _mds = parse_dat(dat)
+        self.mesh_fields = collect_node_fields(_mds, self.mesh)
+        from trifield.data.tdr_extract import collect_region_fields
+        self.mesh.region_fields = collect_region_fields(_mds, self.mesh)
+        txt = dat.read_text(errors="replace")
+        im = re.search(r"Info\s*\{", txt)
+        self._mesh_info = txt[im.end():_match_brace(txt, im.end() - 1)]
         if self.mode == "warm":
-            self._template_ready.clear()
-            self._template_thread = threading.Thread(target=self._make_template, args=(t0,), daemon=True)
-            self._template_thread.start()
             if wait_template:
                 self._template_thread.join()
-                if self.template_dat is None:
+                if self.template_dat is None and self.guess_layout == "template":
                     raise RuntimeError(f"template dump failed ({self._template_error}), see {work / 'tmpl.out'}")
         self.timing["prepare"] = time.monotonic() - t0
         if physics is not None:
@@ -509,6 +542,9 @@ class Twin:
         from trifield.data.tdr_extract import convert_tdr_to_dfise
         work = self.run_dir / "twin"
         try:
+            if self.guess_layout != "template":
+                self._start_servers(template=False)
+                return
             if not self._start_servers():
                 deck = make_deck(self.base, "tmpl", 0.0, 0.0,
                                  "\tCoupled(Iterations= 0){ Poisson Electron Hole }\n\tPlot(FilePrefix= \"tmpl\")",
@@ -526,21 +562,34 @@ class Twin:
             self.timing["template"] = time.monotonic() - t0
             self._template_ready.set()
 
-    def _start_servers(self) -> bool:
-        """Start the persistent sdevice processes and have the first one write the template (tmpl_des.tdr).
-        False (and no servers) when disabled or when the first one cannot write it."""
+    def _start_servers(self, template: bool = True) -> bool:
+        """Start the persistent sdevice processes; every one initialises its device at once (an empty Solve
+        section). template: the first one writes the template (tmpl_des.tdr) and this waits for it. False (and no
+        servers) when disabled or when the first one cannot write the template."""
         n = min(self.max_parallel, 2) if self.servers is None else int(self.servers)
         if self.mode != "warm" or n <= 0:
             return False
         t0 = time.monotonic()
         work = self.run_dir / "twin"
         deck = make_deck(self.base, "srv", 0.0, 0.0, "", grid=GRID)
-        srv = [SdeviceServer(work, server_deck(deck, output=f"srv{k}_des.log"), f"srv{k}", self.server_threads).start()
-               for k in range(n)]
+        try:
+            srv = [SdeviceServer(work, server_deck(deck, output=f"srv{k}_des.log"), f"srv{k}", self.server_threads).start()
+                   for k in range(n)]
+        except Exception as exc:                                          # noqa: broad-except
+            log.warning("sdevice servers did not start (%s); one sdevice process per solve", exc)
+            return False
         pool = ServerPool(srv)
         self._pool_final = weakref.finalize(self, pool.close)          # also on garbage collection / exit
-        for s in srv[1:]:                    # initialise the others' devices meanwhile (empty Solve section)
-            threading.Thread(target=s.solve, args=(f"{s.name}_init", "", False), daemon=True).start()
+
+        def warm(s):
+            s.solve(f"{s.name}_init", "", False)
+            with self._lock:
+                self.timing[f"{s.name}_ready"] = time.monotonic() - self._t_prepare
+        for s in srv[1 if template else 0:]:
+            threading.Thread(target=warm, args=(s,), daemon=True).start()
+        if not template:
+            self._pool = pool
+            return True
         r = srv[0].solve("tmpl", '\tPlot(FilePrefix= "tmpl")', plot=False)
         if r is None or not (work / "tmpl_des.tdr").exists():
             log.warning("sdevice server did not start (see %s); one sdevice process per solve", work / "srv0.out")
@@ -567,6 +616,7 @@ class Twin:
         """One plain warm start: by a server when one is alive, else as its own sdevice process (also when the
         server goes down during the request)."""
         t0 = time.monotonic()
+        self._template_ready.wait()                     # servers started
         srv = self._pool.acquire() if self._pool is not None else None
         if srv is not None:
             wait = time.monotonic() - t0
@@ -602,8 +652,8 @@ class Twin:
         Sentaurus' at a few AlGaN/HfO2 corner vertices under the gate, where Sentaurus' first Newton steps then go astray."""
         if self.solver is None:
             return
-        self._template_ready.wait()
-        if self.template_dat is None:
+        self._template_ready.wait()                     # servers started (and the template, for that layout)
+        if self.guess_layout == "template" and self.template_dat is None:
             return
         import pickle
         from trifield.physics.export import trap_factors
@@ -618,10 +668,19 @@ class Twin:
                 psi = np.zeros(md.n)
                 phin = np.where(md.semi, 20.0, 0.0); phip = np.where(md.semi, -20.0, 0.0)
                 self.write_guess(dict(zip(FIELD_FUNCS, (psi, phin, phip))), "gtrapcal", 0.0, 0.0)
-                solve = ('\tLoad(FilePrefix= "gtrapcal")\n\tCoupled(Iterations= 0){ Poisson Electron Hole }\n'
-                         '\tPlot(FilePrefix= "trapcalp")')
-                self._sdevice("trapcal", make_deck(self.base, "trapcal", 0.0, 0.0, solve, grid=GRID,
-                                                   math_extra="RHSMin= 1e30"))
+                # a server plots the loaded state directly: the same NetTrappedCharge (bitwise, also after other
+                # requests) as the 0-iteration deck below, without a process of its own
+                srv = self._pool.acquire() if self._pool is not None else None
+                if srv is not None:
+                    try:
+                        srv.solve("trapcal", '\tLoad(FilePrefix= "gtrapcal")\n\tPlot(FilePrefix= "trapcalp")', plot=False)
+                    finally:
+                        self._pool.release(srv)
+                if not (work / "trapcalp_des.tdr").exists():
+                    solve = ('\tLoad(FilePrefix= "gtrapcal")\n\tCoupled(Iterations= 0){ Poisson Electron Hole }\n'
+                             '\tPlot(FilePrefix= "trapcalp")')
+                    self._sdevice("trapcal", make_deck(self.base, "trapcal", 0.0, 0.0, solve, grid=GRID,
+                                                       math_extra="RHSMin= 1e30"))
                 plot = next(iter(sorted(work.glob("trapcalp*_des.tdr"))), None)
                 if plot is None:
                     raise RuntimeError("no calibration plot")
@@ -760,9 +819,10 @@ class Twin:
     def write_guess(self, fields: dict, prefix: str, vg: float | None = None,
                     vd: float | None = None) -> None:
         """Prediction -> DF-ISE -> TDR on the round-tripped grid."""
-        self._template_ready.wait()
-        if self.template_dat is None:
-            raise RuntimeError(f"no template to write the guess {prefix} ({self._template_error})")
+        if self.guess_layout == "template":
+            self._template_ready.wait()
+            if self.template_dat is None:
+                raise RuntimeError(f"no template to write the guess {prefix} ({self._template_error})")
         t0 = time.monotonic()
         work = self.run_dir / "twin"
         self._bias = getattr(self, "_bias", {})
@@ -771,8 +831,12 @@ class Twin:
         fields = {k: v for k, v in dict(fields).items() if not k.startswith("_")}
         if "QuasiFermiPotential" not in fields:
             fields["QuasiFermiPotential"] = electrode_fermi_levels(self.mesh, *self._bias[prefix])
-        _rewrite_dat(self.template_dat, work / f"{prefix}.dat", self.mesh, fields, only=GUESS_DATASETS)
-        _tdx(["--dfise2tdr", self.template_grd.name, f"{prefix}.dat", f"{prefix}_des.tdr"], work)
+        if self.guess_layout == "template":
+            _rewrite_dat(self.template_dat, work / f"{prefix}.dat", self.mesh, fields, only=GUESS_DATASETS)
+            _tdx(["--dfise2tdr", self.template_grd.name, f"{prefix}.dat", f"{prefix}_des.tdr"], work)
+        else:
+            _guess_dat(work / f"{prefix}.dat", self.mesh, self._mesh_info, fields)
+            _tdx(["--dfise2tdr", "msh.grd", f"{prefix}.dat", f"{prefix}_des.tdr"], work)
         if not (work / f"{prefix}_des.tdr").exists():
             raise RuntimeError(f"writing the initial guess {prefix} failed")
         with self._lock:
@@ -914,7 +978,7 @@ class Twin:
         if (fallbacks and self.mode == "warm" and refine and self.solver_escalate is not None and refine_info
                 and not refine_info.get("converged") and "error" not in refine_info):
             recipes.insert(len(recipes) - (recipes[-1][0] == "cold"), ("escalated", vg, vd, None))
-        cur, total_wall, total_cpu, newton, used, served = None, 0.0, 0.0, 0, None, None
+        cur, total_wall, total_cpu, newton, used, served, server_wait = None, 0.0, 0.0, 0, None, None, 0.0
         for i, (name, ev_g, ev_d, solve) in enumerate(recipes):
             if name == "nbguess":
                 nbf = self._neighbour_fields(vg, vd, max_dv=self.nbguess_dv)
@@ -966,6 +1030,7 @@ class Twin:
             newton += t["newton"]
             if t.get("server"):
                 served = t["server"]
+                server_wait += t.get("server_wait", 0.0)
             if cur is not None:
                 used = name
                 break
@@ -976,7 +1041,7 @@ class Twin:
                "recipe": used, "attempts": recipes.index(next(r for r in recipes if r[0] == used)) + 1
                if used else len(recipes), "newton": newton, "wall": total_wall, "cpu": total_cpu}
         if served:
-            row["server"] = served
+            row["server"], row["server_wait"] = served, server_wait
         with self._lock:
             self.log.append(row)
         return cur
