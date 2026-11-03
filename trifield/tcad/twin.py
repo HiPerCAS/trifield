@@ -63,12 +63,13 @@ GRID = "grid_des.tdr"        # DF-ISE round-tripped mesh the twin solves on
 # of its time on accuracy Sentaurus does not use. The Gummel sweeps are still needed: from the raw guess a few low-density
 # buffer vertices get Newton components of 1e5-1e9 V and throttle every step through the clip. At Vg >= 0, 12 sweeps with
 # 2 Poisson-Newton steps each remove them as reliably as 25 x 50 (same Sentaurus counts on 8 e-mode + 3 d-mode designs).
-# At Vg < 0 they do not: below threshold the cheap sweeps can lead the Newton to a state (the floating hole layer under the
-# gate) from which Sentaurus needs 8-23 instead of 5 steps even at merit 3e-7, so there only the tolerance is loosened.
-# refine_fields() (screening: refined currents) and the escalation keep their configs: at merit 1e-3 the refined current is
-# only good to ~10%.
+# At Vg < 0 neither holds below threshold (d-mode benchmark designs): the cheap sweeps can lead the Newton to a state (the
+# floating hole layer under the gate) from which Sentaurus needs 12-23 instead of 5 steps even at merit 3e-7, and merit 1e-3
+# cost 10 instead of 5 steps at another point. There the default schedule runs and Newton only stops at 1e-6 (converged_tol)
+# instead of 1e-9. refine_fields() (screening: refined currents) and the escalation keep their configs: at merit 1e-3 the
+# refined current is only good to ~10%.
 WARM_REFINE = {"newton_tol": 1e-3, "converged_tol": 1e-3, "gummel_iters": 12, "gummel_poisson_maxit": 2}
-WARM_REFINE_NEG = {"newton_tol": 1e-3, "converged_tol": 1e-3}
+WARM_REFINE_NEG = {"newton_tol": 1e-6}
 
 
 # ---------------------------------------------------------------------------
