@@ -81,6 +81,31 @@ Python >= 3.14, or the `zstd` CLI.
 `RefineConfig(trace=True)` records per-iteration Newton diagnostics (merit parts, damping, step sizes,
 frozen count, linear-solve residual) in `RefineResult.extra["trace"]`.
 
+`Solver.refine(guess, vg, vd, config=...)` takes a RefineConfig or a dict of field overrides for one call
+(thread-local, so worker threads can share a solver with different settings).
+
+### Warm-start schedule (`trifield.tcad.twin.WARM_REFINE`, `WARM_REFINE_NEG`)
+
+The defaults above converge the refinement to a merit of 1e-9; that is what refined-current screening needs
+(at 1e-9 the refined drain current matches Sentaurus to ~2e-4, at 1e-3 only to ~10%). A Sentaurus warm start
+does not: from merit 1e-3, 1e-4, 1e-5 or 1e-9 Sentaurus took the same number of Newton steps (5-7, 32 points
+of 8 e-mode designs), from ~1e-2 4-15 more, from the unrefined guess it failed on 30/32. The twin therefore
+refines its warm-start guesses (`Twin.solve_point` only) with
+- Vg >= 0: Newton to 1e-3 (`newton_tol`, `converged_tol`) after 12 Gummel sweeps of 2 Poisson-Newton steps
+  each (`gummel_iters`, `gummel_poisson_maxit`) instead of 25 fully converged ones. The sweeps cannot be
+  dropped: from the raw guess a few low-density buffer vertices (n ~ 1e0..1e7) get Newton components of
+  1e5-1e9 V and the global step clip throttles every step to lambda ~ 1e-10; >= 5 sweeps remove them.
+- Vg < 0: the default sweeps and Newton to 1e-6. Below threshold at negative gate bias the cheap sweeps led
+  to states (floating hole layer) from which Sentaurus needed 12-23 instead of 5 steps even at merit 3e-7,
+  and merit 1e-3 cost 10 instead of 5 steps at another point (d-mode benchmark designs).
+`Twin.refine_fields` and the escalation keep their configs.
+
+Where the time went before (default schedule, main a86c895): CPU 20 s per point at 3-9k vertices, of which
+the 25 Gummel sweeps 63% (157 Poisson factorisations per point) and the Fermi inversion `r_of_eta_t`
+53% (30 Newton iterations per call, ~500 calls per point; 6 give bitwise the same result); GPU 12 s per
+point at 11-13k vertices, of which the Ruiz equilibration (then 12 SpGEMMs per solve) 38%. With the
+warm-start schedule: ~2 s per point on the GPU, now led by the CPU hole solve (~30%).
+
 ## Interface-trap calibration (`Twin.calibrate_traps`, `export.trap_factors`)
 
 Our trap density per vertex (sigma * A_interface / V_box) is Sentaurus' except at convex corners of the top
@@ -99,12 +124,17 @@ they agree with Sentaurus to about 5e-4 relative on true solutions.
 Backends:
 - **CPU:** scipy/SuperLU.
 - **GPU** (`device="cuda:k"`): cuDSS through nvmath (`pip install -e ".[gpu]"`), reusing the symbolic
-  analysis per equation type. Every system is **two-sided (Ruiz) equilibrated** and gets 2 steps of
+  analysis per equation type (one analysis per type and design). Every system is **two-sided (Ruiz)
+  equilibrated** (6 sweeps, applied to the CSR data in place: ~1 ms per solve) and gets 2 steps of
   iterative refinement: the Scharfetter-Gummel and joint Jacobians span ~1e-50..1e+10, and with row
   scaling alone cuDSS returned solutions with relative residuals up to 1e11 (joint Newton: median 1e2),
   so the refinement stalled and Sentaurus diverged from its guesses. With Ruiz scaling the GPU residuals
   match SuperLU (< 1e-13) and the refinement trajectory matches the CPU one. The linear hole solve
-  (p-scaled, a few ms) stays on the CPU.
+  (p-scaled) stays on the CPU: cuDSS + Ruiz is 15x faster there but fails on the first hole solve at
+  on-state points (unknowns spanning 1e-3..1e31).
+- The twin refines on the CPU below 4k vertices (`Twin.refine_cpu_below`; the warm-start refinement is
+  1.6x faster on the GPU at 3.2k vertices, 3.8x at 8.6k) with torch capped at 4 intra-op threads
+  (`Twin.refine_threads`): concurrent CPU refinements with one thread per core oversubscribe the host.
 - **End to end** (25k-node mesh, capped refinement): 21 s on the GPU against 360 s on the CPU (17x);
   the surrogate ensemble pass is 1 s against 20 s. In the paired twin benchmark this took the warm twin
   from ~4.5x to 12x faster than the production Sentaurus flow.
