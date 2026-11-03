@@ -16,14 +16,14 @@ python -m trifield.tcad.extract runs/train/sim_* --out_dir data/graphs --workers
 python -m trifield.data.split data/graphs --train data/train --val data/val --val_frac 0.15
 
 # 2. Surrogate ensemble: one member per GPU / seed. Data-only loss with per-(material, field)
-#    homoscedastic balancing, standardised inputs, fin-local y and no LayerNorm: this recipe gave the
-#    lowest field error in our tests (the continuity term trades field accuracy for current
-#    conservation; enable it with --physics_max_weight 0.1).
+#    homoscedastic balancing, standardised inputs, fin-local y, no LayerNorm and a global node: this
+#    recipe gave the lowest field error in our tests (the paper's continuity term made the fields less
+#    accurate; it is still available with --physics_max_weight 0.1).
 for seed in 0 1; do
   CUDA_VISIBLE_DEVICES=$seed python -m trifield.train --data_dir data/train --val_data_dir data/val \
       --epochs 35 --max_nodes_per_batch 40000 --grad_checkpoint --cache_data --weight_decay 1e-4 \
       --input_norm --local_y --drop_vor --norm none --balance --gate_weight 8 --physics_max_weight 0 \
-      --run_name ens --seed $seed &
+      --global_node --run_name ens --seed $seed &
 done
 wait
 
@@ -35,8 +35,9 @@ python -m trifield.tcad.benchmark --runs runs/bench --log runs/bench_graphs/camp
     --modes warm cold --device cuda --refine_device auto --refine_cap 30 --escalate \
     --out runs/bench_twin.csv --workers $((WORKERS / 3))
 
-# 4. Next acquisition: mesh-only candidate pool, four-criterion score, simulate the top-K.
+# 4. Next acquisition: mesh-only candidate pool in the reliable range (--strict), four-criterion score
+#    with current per footprint in the objective (--w_area), simulate the top-K.
 python -m trifield.tcad.campaign --par "$PAR" --work_dir runs/cand --out_dir runs/cand_graphs \
-    --fins 1 2 3 4 5 6 8 --n_per_fins 40 --mesh_only --keep --workers "$WORKERS" --seed 7
+    --fins 1 2 3 4 5 --n_per_fins 40 --mesh_only --strict --keep --workers "$WORKERS" --seed 7
 python -m trifield.active_learning --ckpts checkpoints/ens/last_seed*.pt \
-    --candidates runs/cand_graphs --train_designs data/train --top_k 16 --out_csv runs/selection.csv
+    --candidates runs/cand_graphs --train_designs data/train --top_k 16 --w_area 1 --out_csv runs/selection.csv
