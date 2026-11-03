@@ -25,7 +25,8 @@ import numpy as np
 import torch
 from torch_geometric.loader import DataLoader, DynamicBatchSampler
 
-from trifield.data.dataset import BaselineDeltaDataset, DeviceMeshDataset, HybridDataset
+from trifield.data.dataset import (BaselineDeltaDataset, ConcatGraphs, DeviceMeshDataset, HybridDataset, MixedDataset,
+                                   PseudoLabelDataset, UnlabeledBiasDataset)
 from trifield.losses import (CombinedLoss, channel_weights, gate_weights, ContinuityResidualLoss, PoissonResidualLoss,
                              contact_mask)
 from trifield.model import DeviceGNN
@@ -113,7 +114,9 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
           baseline_delta=False, weight_decay=1e-4, act="leaky", norm="layer",
           input_norm=False, local_y=False, drop_vor=False, balance=False,
           channel_weight=0.0, gate_weight=0.0, edge_weight=0.0, hybrid_from=None, hybrid_x="",
-          hybrid_edge="", hybrid_drop_valid=False):
+          hybrid_edge="", hybrid_drop_valid=False, exact_weight=0.0, exact_roots="", exact_norm="jacobi",
+          exact_rho="log", exact_scale=0.1, exact_w_poisson=1.0, exact_w_electron=1.0, exact_start=1, exact_ramp=0,
+          unlabeled_dir=None, unlabeled_per_design=0, unlabeled_exclude="", progress_every=0, pseudo_dir=None):
     args = {k: v for k, v in locals().items()}
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -130,6 +133,15 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
     ds = DS(data_dir, cache=cache_data)
     if len(ds) == 0:
         raise SystemExit(f"no .pt graphs in {data_dir}")
+    if pseudo_dir:
+        # mesh-only designs with converged exact-refinement solutions as targets (requires --unlabeled_dir = mesh dir)
+        ds = ConcatGraphs(ds, PseudoLabelDataset(pseudo_dir, unlabeled_dir))
+        unlabeled_dir = None
+    if unlabeled_dir:
+        # mesh-only designs (physics loss only): bias set per design, targets masked out of the data loss
+        excl = [l.strip() for l in open(unlabeled_exclude)] if unlabeled_exclude else []
+        unl = UnlabeledBiasDataset(unlabeled_dir, per_design=unlabeled_per_design, seed=seed, exclude=excl)
+        ds = MixedDataset(ds, unl)
     val_ds = DS(val_data_dir, cache=cache_data) if val_data_dir else None
     if val_ds is not None and len(val_ds) == 0:
         val_ds = None
@@ -157,6 +169,15 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
 
     criterion = CombinedLoss(w_cont=cont_weight, w_pois=poisson_weight, balance=balance,
                              w_edge=edge_weight).to(dev)
+    exact = None
+    if exact_weight > 0:
+        # Sentaurus' discrete equations (trifield.physics.loss) on every graph whose design has a per-mesh export
+        from trifield.physics.loss import ExactPhysicsLoss, PhysicsLossConfig, PhysicsRegistry
+        reg = PhysicsRegistry([r for r in exact_roots.split(",") if r], dev)
+        exact = ExactPhysicsLoss(reg, PhysicsLossConfig(
+            w_poisson=exact_w_poisson, w_electron=exact_w_electron, poisson_norm=exact_norm, rho=exact_rho,
+            scale_poisson=exact_scale, scale_cont=exact_scale))
+        log.info("exact physics loss: weight %g, %d designs with exports", exact_weight, len(reg))
     optimizer = torch.optim.AdamW([{"params": model.parameters()},
                                    {"params": criterion.parameters(), "weight_decay": 0.0}],
                                   lr=lr, weight_decay=weight_decay)
@@ -176,7 +197,7 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
     csv_w = csv.writer(csv_file)
     csv_w.writerow(["epoch", "total", "data", "continuity", "poisson", "physics_weight", "lr",
                     "val_rmse_psi", "val_rmse_phi_n", "val_rmse_phi_p", "val_continuity", "val_poisson",
-                    "sec"])
+                    "sec", "exact", "exact_poisson", "exact_electron", "exact_merit", "exact_weight"])
 
     model.train()
     epoch = 0
@@ -188,6 +209,9 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
             physics_weight = 0.0
         sums = {"total": 0.0, "data": 0.0, "continuity": 0.0, "poisson": 0.0}
         n_batches = 0
+        ex_w = (exact_weight * min(1.0, (epoch - exact_start + 1) / max(exact_ramp, 1)) if exact_ramp > 0
+                else exact_weight) if (exact is not None and epoch >= exact_start) else 0.0
+        ex_sums, ex_n = {"exact": 0.0, "poisson": 0.0, "electron": 0.0, "merit": 0.0}, 0
         for batch in loader:
             batch = batch.to(dev)
             optimizer.zero_grad()
@@ -199,12 +223,21 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
                                contact=contact_mask(batch.x), physics_weight=physics_weight,
                                weights=node_weights(batch, channel_weight, gate_weight),
                                valid=getattr(batch, "y_valid", None))
+            if ex_w > 0:
+                l_ex, st = exact(pred_phys, batch)
+                if st.get("n_graphs", 0):
+                    losses["total"] = losses["total"] + ex_w * l_ex
+                    ex_sums["exact"] += float(l_ex.detach()); ex_n += 1
+                    for k in ("poisson", "electron", "merit"):
+                        ex_sums[k] += st.get(k, 0.0)
             losses["total"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             for k in sums:
                 sums[k] += float(losses[k].detach())
             n_batches += 1
+            if progress_every and n_batches % progress_every == 0:
+                log.info("  epoch %d batch %d: %.1f s", epoch, n_batches, time.time() - t0)
         if scheduler is not None:
             scheduler.step()
         cur_lr = optimizer.param_groups[0]["lr"]
@@ -218,6 +251,9 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
             msg = (f"epoch {epoch:4d} | total={avg['total']:.5f} data={avg['data']:.5f} "
                    f"cont={avg['continuity']:.4f} pw={physics_weight:.3f} lr={cur_lr:.2e} "
                    f"({time.time() - t0:.0f}s)")
+            if ex_n:
+                msg += (f" exact={ex_sums['exact'] / ex_n:.5f} (P {ex_sums['poisson'] / ex_n:.5f} "
+                        f"n {ex_sums['electron'] / ex_n:.5f} merit {ex_sums['merit'] / ex_n:.4f}) w={ex_w:g}")
             if vm is not None:
                 r = vm["rmse"]
                 msg += (f" | val RMSE[V] psi={r[0]:.3f} phi_n={r[1]:.3f} phi_p={r[2]:.3f} "
@@ -236,7 +272,8 @@ def train(data_dir, val_data_dir=None, epochs=500, lr=1e-3, hidden_dim=128, n_la
         csv_w.writerow([epoch, avg["total"], avg["data"], avg["continuity"], avg["poisson"],
                         physics_weight, cur_lr]
                        + ([float(v) for v in vm["rmse"]] + [vm["continuity"], vm["poisson"]]
-                          if vm is not None else [None] * 5) + [round(time.time() - t0, 1)])
+                          if vm is not None else [None] * 5) + [round(time.time() - t0, 1)]
+                       + [ex_sums[k] / max(ex_n, 1) for k in ("exact", "poisson", "electron", "merit")] + [ex_w])
         csv_file.flush()
         if checkpoint_every > 0 and epoch % checkpoint_every == 0:
             save_checkpoint(run_dir / f"epoch_{epoch:04d}_seed{seed}.pt", model, y_mean, y_std,
@@ -296,6 +333,24 @@ def main(argv=None):
     ap.add_argument("--global_node", action="store_true",
                     help="learned virtual node after every block (long-range electrostatics)")
     ap.add_argument("--cache_data", action="store_true", help="keep all graphs in RAM after first load")
+    ap.add_argument("--exact_weight", type=float, default=0.0,
+                    help="weight of the exact-operator physics loss (trifield.physics.loss; 0 = off)")
+    ap.add_argument("--exact_roots", default="",
+                    help="comma-separated roots of per-mesh exports (<root>/<design>/twin/physics/mesh_data.pkl)")
+    ap.add_argument("--exact_norm", choices=["jacobi", "pdiag"], default="jacobi", help="Poisson row normalisation")
+    ap.add_argument("--exact_rho", choices=["log", "sq"], default="log")
+    ap.add_argument("--exact_scale", type=float, default=0.1, help="scale of the robust log penalty")
+    ap.add_argument("--exact_w_poisson", type=float, default=1.0)
+    ap.add_argument("--exact_w_electron", type=float, default=1.0)
+    ap.add_argument("--exact_start", type=int, default=1)
+    ap.add_argument("--exact_ramp", type=int, default=0, help="epochs over which the exact weight ramps up")
+    ap.add_argument("--unlabeled_dir", default=None,
+                    help="directory of mesh-only base graphs (<design>__mesh.pt): physics-only training items")
+    ap.add_argument("--unlabeled_per_design", type=int, default=0, help="biases per unlabelled design (0 = all 11)")
+    ap.add_argument("--unlabeled_exclude", default="", help="file of design names to leave out of the unlabelled set")
+    ap.add_argument("--progress_every", type=int, default=0, help="log the elapsed time every N batches (0 = off)")
+    ap.add_argument("--pseudo_dir", default=None,
+                    help="refinement pseudo-labels (index.jsonl + .npy) for the mesh graphs in --unlabeled_dir (added as labelled)")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     train(**vars(args))

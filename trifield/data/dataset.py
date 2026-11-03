@@ -162,3 +162,126 @@ class HybridDataset(DeviceMeshDataset):
         if self._cache is not None:
             self._cache[idx] = data
         return data
+
+
+# bias points of a twin-labelled design (Vd = 0 gate sweep, on-state drain sweep, off-state / near threshold)
+STANDARD_BIASES = ((1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (4.0, 0.0), (5.0, 0.0), (5.0, 3.0), (5.0, 6.0), (5.0, 9.0),
+                   (5.0, 12.0), (0.0, 12.0), (0.5, 12.0))
+
+
+class UnlabeledBiasDataset(torch.utils.data.Dataset):
+    """Mesh-only items for physics-only training: one base graph per design (``<design>__mesh.pt``, built like the
+    twin's prediction graph) at ``biases``; the bias columns (13, 14) and ``vg`` / ``vd`` are set per item, targets
+    are zero and ``y_valid`` is False everywhere (the data loss ignores these nodes). ``per_design`` > 0 draws that
+    many biases per design (seeded) instead of all of them."""
+
+    def __init__(self, root, biases=STANDARD_BIASES, per_design: int = 0, seed: int = 0, exclude=()):
+        import random
+        self.root = Path(root).resolve()
+        self.base_files = [f for f in sorted(self.root.glob("*__mesh.pt")) if design_name(f) not in set(exclude)]
+        rng = random.Random(seed)
+        self.items = []
+        for f in self.base_files:
+            bs = list(biases) if per_design <= 0 else rng.sample(list(biases), min(per_design, len(biases)))
+            self.items += [(f, float(vg), float(vd)) for vg, vd in bs]
+        self._cache: dict = {}
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        f, vg, vd = self.items[idx]
+        if f not in self._cache:
+            self._cache[f] = load_graph(f)
+        g = self._cache[f].clone()
+        g.x = g.x.clone()
+        g.x[:, 13] = vg
+        g.x[:, 14] = vd
+        g.vg, g.vd = vg, vd
+        g.y = torch.zeros_like(g.y)
+        g.y_valid = torch.zeros(g.y.shape, dtype=torch.bool)
+        g.snapshot_name = f"unl_vg{vg:+.3f}_vd{vd:.3f}"
+        return g
+
+    def __repr__(self):
+        return f"UnlabeledBiasDataset(root={self.root}, designs={len(self.base_files)}, n={len(self.items)})"
+
+
+class MixedDataset(torch.utils.data.Dataset):
+    """Labelled graphs (y_valid = True where absent) followed by unlabelled items."""
+
+    def __init__(self, labeled, unlabeled):
+        self.labeled, self.unlabeled = labeled, unlabeled
+
+    def __len__(self):
+        return len(self.labeled) + len(self.unlabeled)
+
+    def __getitem__(self, idx):
+        if idx < len(self.labeled):
+            g = self.labeled[idx]
+            if getattr(g, "y_valid", None) is None:
+                g = g.clone()
+                g.y_valid = torch.ones(g.y.shape, dtype=torch.bool)
+            return g
+        return self.unlabeled[idx - len(self.labeled)]
+
+    def __repr__(self):
+        return f"MixedDataset({self.labeled!r} + {self.unlabeled!r})"
+
+
+class PseudoLabelDataset(torch.utils.data.Dataset):
+    """Mesh-only designs labelled by the exact refinement (converged ``trifield.physics`` solutions, see
+    runs/agents/phys/scripts/pseudo_labels.py): base graph ``<design>__mesh.pt`` + targets ``<pseudo_dir>/<file>.npy``
+    listed in ``<pseudo_dir>/index.jsonl`` (rows with conv = true)."""
+
+    def __init__(self, pseudo_dir, mesh_dir):
+        import json
+        self.pdir, self.mdir = Path(pseudo_dir), Path(mesh_dir)
+        rows = [json.loads(l) for l in open(self.pdir / "index.jsonl")]
+        self.items = [(r["design"], float(r["vg"]), float(r["vd"]), r["file"]) for r in rows if r.get("conv") and r.get("file")]
+        self._cache: dict = {}
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        import numpy as np
+        d, vg, vd, f = self.items[idx]
+        if d not in self._cache:
+            self._cache[d] = load_graph(self.mdir / f"{d}__mesh.pt")
+        g = self._cache[d].clone()
+        g.x = g.x.clone()
+        g.x[:, 13] = vg
+        g.x[:, 14] = vd
+        g.vg, g.vd = vg, vd
+        g.y = torch.from_numpy(np.load(self.pdir / f))
+        g.y_valid = torch.ones(g.y.shape, dtype=torch.bool)
+        g.snapshot_name = f"pseudo_vg{vg:+.3f}_vd{vd:.3f}"
+        return g
+
+    def __repr__(self):
+        return f"PseudoLabelDataset({self.pdir}, n={len(self.items)})"
+
+
+class ConcatGraphs(torch.utils.data.Dataset):
+    """Several graph datasets back to back; adds y_valid = True where a graph has none."""
+
+    def __init__(self, *parts):
+        self.parts = parts
+
+    def __len__(self):
+        return sum(len(p) for p in self.parts)
+
+    def __getitem__(self, idx):
+        for p in self.parts:
+            if idx < len(p):
+                g = p[idx]
+                if getattr(g, "y_valid", None) is None:
+                    g = g.clone()
+                    g.y_valid = torch.ones(g.y.shape, dtype=torch.bool)
+                return g
+            idx -= len(p)
+        raise IndexError(idx)
+
+    def __repr__(self):
+        return "ConcatGraphs(" + " + ".join(repr(p) for p in self.parts) + ")"
