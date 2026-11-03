@@ -197,8 +197,21 @@ validation set (480 snapshots) and on 10 designs outside the training data:
 | current recipe, 1 network, production data | 0.22 / 0.22 / 0.20 | 0.16 / 0.15 / 0.22 |
 | current recipe + active learning (3 rounds), 5 networks | 0.15 / 0.15 / 0.14 | 0.10 / 0.10 / 0.19 |
 
-The paper's physics term is still available (`--physics_max_weight`, `--poisson_weight`). We did not
-re-test the paper's finding that it helps when extrapolating to much larger arrays (38 fins).
+The paper's physics term is still available (`--physics_max_weight`, `--poisson_weight`), but it is not
+the simulator's discretisation: its Boltzmann closure ignores the band reference in Sentaurus' potential, so
+98% of the vertices of the true solution sit at its density clamp, and the loss is lowest for a device with
+no electrons (the weight-0.1 model moved psi down and Phi_n up by ~0.8 V each, until every vertex was
+carrier-free). We did not re-test the paper's finding that it helps when extrapolating to much larger arrays
+(38 fins).
+
+`trifield.physics.loss` (`--exact_weight`) is a physics term on the exact discrete equations instead: zero at
+Sentaurus' solution, growing monotonically with the error. In paired fine-tunes it did not improve the fields
+(weight 0.03: psi +1..+4%, Phi_n -1..0%), and gradient descent on it from a prediction lowers the residual
+5-50x without moving psi towards the solution. Physics adds information through the solver instead:
+`trifield.pseudolabel` refines the surrogate's guesses for unlabelled meshed designs (~10 s CPU per bias point,
+no Sentaurus) and trains on them as labels; for 249 unlabelled designs this cut the psi error of held-out
+designs of the same pool by 13%, where labelling the same designs with the model's own guesses made it 17%
+worse.
 
 ### Polishing the prediction
 

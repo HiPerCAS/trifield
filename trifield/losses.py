@@ -8,7 +8,11 @@
 
 The physics terms are soft regularisers at the discretisation level of the
 solver (edge lengths, edge-averaged Boltzmann densities, constant mobility),
-not a re-implementation of the Scharfetter-Gummel scheme.
+not a re-implementation of the Scharfetter-Gummel scheme. They do not vanish at
+Sentaurus' solution (the continuity term is ~54 on true fields: the Boltzmann
+closure ignores the band reference in Sentaurus' potential and sits at its clamp)
+and their minimum is a carrier-free device; kept to reproduce the paper. For a
+physics term on the exact discrete equations see ``trifield.physics.loss``.
 """
 from __future__ import annotations
 

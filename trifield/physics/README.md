@@ -183,3 +183,19 @@ Phi_n / Phi_p there as 0 placeholders) when the guess' current is trustworthy.
 - The refinement is not globally convergent. From poor starts (equilibrium, linear Phi) it often stalls
   and Sentaurus may still fail. From the GNN ensemble guess it converged in all 6 validation cases.
 - Tetrahedral meshes only; 3D only.
+
+## Physics loss and pseudo-labels (`loss.py`, `trifield.pseudolabel`)
+
+`ExactPhysicsLoss` evaluates these equations on a predicted triple as a training term: hard Dirichlet values from the
+boundary rules above (bias-shift invariant offsets, one neutrality Newton per design), Poisson rows / (pdiag + q M
+|dSC/dpsi|) [V], electron continuity rows / gross SG flow, carrier-free rows dropped, float64, differentiable. On the
+float32 labels: Poisson ~1e-4 V rms, continuity ~1e-6 (median). Normalisers and the carrier-free mask must come from fixed
+reference fields (`norm_from="ref"`: labels, or the first prediction of an unlabelled item): recomputed from the prediction
+and detached, the dropped d(normaliser)/d(field) term is as large as the kept one on badly balanced rows, and Adam then
+raises the loss at every learning rate down to 1e-6 (a weight of 0.1 doubled the field error). Even with a correct
+gradient, descent on the residual lowers it 5-50x without moving psi towards the solution (a local residual barely sees
+the smooth, long-range part of the surrogate error), so the loss is an option, not part of the recipe.
+
+`trifield.pseudolabel` uses the equations through `Solver.refine` instead: refined guesses (full RefineConfig, ~10 s CPU
+per bias point, 99.6% converged at Vg >= 0) are within 1.6-4 mV of Sentaurus and serve as training labels for meshed but
+unsimulated designs (`train.py --unlabeled_dir <mesh graphs> --pseudo_dir <labels>`).
