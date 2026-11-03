@@ -57,12 +57,13 @@ Vth for each (meshing excluded):
 |---|---|---|---|---|
 | production flow | 1x | | 22.6 h | reference |
 | cold twin (no network) | 1.4x | 0.6-11x | 16.5 h | < 1e-8 / <= 1.6 mV |
-| **warm twin** | **45x** | 16-135x | **0.42 h** | < 1e-8 / <= 0.7 mV |
+| **warm twin** | **53x** | 17-159x | **0.35 h** | < 1e-8 / <= 0.7 mV |
 
-Timings come from one shared workstation and vary between runs: another run of the same code, with
-the previous network ensemble, gave a 32x median (0.50 h in total); Sentaurus itself took about 20%
-longer in that run, so most of the difference is machine load. The cold-twin row is from an earlier
-run. Every bias point converged; all but two converged directly from the polished prediction.
+Timings come from one shared workstation and vary with its load. The warm-twin row is the first of two
+runs of the current code (the second: 53x, 0.35 h); the version before the persistent Sentaurus
+processes (see [Running Sentaurus](#running-sentaurus)) ran at 38x (0.49 h) on the same day. The
+cold-twin row is from an earlier run. Every bias point converged; all but one or two per run converged
+directly from the polished prediction.
 
 ### Finding enhancement-mode designs
 
