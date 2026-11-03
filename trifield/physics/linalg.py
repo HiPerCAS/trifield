@@ -100,6 +100,33 @@ class Backend:
         return x if dc is None else dc * x
 
     def _ruiz(self, A, b, sweeps=6):
+        """Two-sided equilibration D_r A D_c (6 sweeps of sqrt row / column max scaling) on the CSR data in place of
+        the former diags(r) @ M @ diags(c) products: same values bit for bit (each entry is (r_i a_ij) c_j either
+        way), the sparsity pattern of A is kept (explicit zeros included, so the cached cuDSS analysis stays valid),
+        and no sparse matrix products (12 SpGEMMs per solve before)."""
+        if not self.gpu:
+            return self._ruiz_spgemm(A, b, sweeps)
+        import cupyx
+        xp = self.xp
+        n, m = A.shape
+        rows = xp.repeat(xp.arange(n, dtype=A.indices.dtype), xp.diff(A.indptr).astype(xp.int64))
+        cols = A.indices
+        data = A.data.copy()
+        dr, dc = xp.ones(n), xp.ones(m)
+        for _ in range(sweeps):
+            ad = xp.abs(data)
+            r = xp.zeros(n); c = xp.zeros(m)
+            cupyx.scatter_max(r, rows, ad); cupyx.scatter_max(c, cols, ad)
+            r = 1.0 / xp.sqrt(xp.clip(xp.where(r > 0, r, 1.0), 1e-300, None))
+            c = 1.0 / xp.sqrt(xp.clip(xp.where(c > 0, c, 1.0), 1e-300, None))
+            data = (r[rows] * data) * c[cols]
+            dr *= r; dc *= c
+        M = self.sp.csr_matrix((data, A.indices.copy(), A.indptr.copy()), shape=A.shape)
+        M.has_sorted_indices = True
+        return M, dr * b, dc
+
+    def _ruiz_spgemm(self, A, b, sweeps=6):
+        """Reference implementation (sparse products with diagonal matrices)."""
         xp, sp = self.xp, self.sp
         n = A.shape[0]
         dr, dc = xp.ones(n), xp.ones(A.shape[1])
