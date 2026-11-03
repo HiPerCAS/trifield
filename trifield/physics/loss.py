@@ -47,6 +47,11 @@ class PhysicsLossConfig:
                                           # lets an unanchored prediction deplete the device and freeze every
                                           # continuity row: physics-only test-time training found that state)
     freeze_from_labels: bool = True       # labelled graphs: carrier-free rows from the label fields, not the prediction
+    # where the row normalisers (Jacobi diagonal, gross flows) and the carrier-free mask come from: "pred" = the current
+    # prediction, detached (the gradient then ignores d(normaliser)/d(fields), which is as large as the kept term on rows
+    # with imbalance ~1: the step is not a descent direction of the reported loss); "ref" = fixed reference fields (the
+    # labels, or for unlabelled items the first prediction seen), i.e. a constant-weight least-squares residual
+    norm_from: str = "pred"
     scale_poisson: float = 0.1            # rho scale s [V-equivalent] of the Poisson rows
     scale_cont: float = 0.1               # rho scale of the continuity rows (|r / gross| <= 1)
     freeze_n: float = 1e-2                # cm^-3, as RefineConfig.freeze_n
@@ -164,17 +169,21 @@ class MeshPhysics:
     # ------------------------------------------------------------------ residuals
     def residuals(self, fields, vg, vd, cfg: PhysicsLossConfig | None = None, holes: bool | None = None, ref=None):
         """Normalised residual rows of a (n,3) field triple: dict(poisson, electron[, hole], n_frozen). ``ref``: fields
-        that decide the carrier-free (dropped) continuity rows instead of the prediction (e.g. the labels)."""
+        that decide the carrier-free (dropped) continuity rows instead of the prediction (e.g. the labels), and with
+        cfg.norm_from == "ref" also the row normalisers."""
         cfg = cfg or PhysicsLossConfig()
         eq = self.eq
         psi, phin, phip = self.apply_boundary(fields, vg, vd)
+        use_ref = ref is not None and cfg.norm_from == "ref"
+        npsi, nphin, nphip = (self.apply_boundary(ref.detach(), vg, vd) if use_ref
+                              else (psi.detach(), phin.detach(), phip.detach()))
         # Poisson
         sc = eq.space_charge(psi, phin, phip)
         rp = torch.sparse.mm(self.K, psi[:, None])[:, 0] + self.qM * sc
         if cfg.poisson_norm == "jacobi":
             with torch.enable_grad():
-                P = psi.detach().clone().requires_grad_(True)
-                dsc, = torch.autograd.grad(eq.space_charge(P, phin.detach(), phip.detach()).sum(), P)
+                P = npsi.detach().clone().requires_grad_(True)
+                dsc, = torch.autograd.grad(eq.space_charge(P, nphin, nphip).sum(), P)
             diag = self.pdiag + self.qM * dsc.abs()
         else:
             diag = self.pdiag
@@ -183,16 +192,21 @@ class MeshPhysics:
         er, em = eq.electron_elem(psi[eq.Ts], phin[eq.Ts], lag=cfg.lag_mobility)
         z = torch.zeros(eq.n, dtype=DT, device=self.dev)
         r = z.index_add(0, eq.Ts.reshape(-1), er.reshape(-1))
+        if use_ref:
+            with torch.no_grad():
+                _, em = eq.electron_elem(npsi[eq.Ts], nphin[eq.Ts], lag=True)
         m = z.index_add(0, eq.Ts.reshape(-1), em.reshape(-1).detach())
         if cfg.recombination:
             RV = eq.Msemi * eq.recombination(psi, phin, phip)
-            r = r - RV; m = m + RV.detach().abs()
+            r = r - RV
+            with torch.no_grad():
+                m = m + (eq.Msemi * eq.recombination(npsi, nphin, nphip)).abs() if use_ref else m + RV.detach().abs()
         V = self.V
         with torch.no_grad():
             if ref is not None:
                 Ec, Ev, n, p, gn, gp = eq.bands(*self.apply_boundary(ref.detach(), vg, vd))
             else:
-                Ec, Ev, n, p, gn, gp = eq.bands(psi.detach(), phin.detach(), phip.detach())
+                Ec, Ev, n, p, gn, gp = eq.bands(npsi, nphin, nphip)
             thr = torch.full_like(n, cfg.freeze_n)
             for idx, conc, emid, cc, K in eq.traps:
                 Et = (Ec[idx] + Ev[idx]) / 2 + KT / 2 * torch.log(eq.Nv[idx] / eq.Nc[idx]) + emid
@@ -265,6 +279,7 @@ class ExactPhysicsLoss(torch.nn.Module):
         super().__init__()
         self.reg = registry
         self.cfg = cfg or PhysicsLossConfig()
+        self._ref: dict = {}                 # norm_from="ref", unlabelled items: first prediction seen (CPU, float32)
 
     def graph_terms(self, pred, design, vg, vd, ref=None):
         cfg = self.cfg
@@ -293,10 +308,17 @@ class ExactPhysicsLoss(torch.nn.Module):
             if d not in self.reg:
                 continue
             ref = None
-            if self.cfg.freeze_from_labels and hasattr(batch, "y") and batch.y is not None:
+            labelled = False
+            if hasattr(batch, "y") and batch.y is not None:
                 v = getattr(batch, "y_valid", None)
-                if v is None or bool(v[ptr[i]:ptr[i + 1]].all()):
-                    ref = batch.y[ptr[i]:ptr[i + 1]]
+                labelled = v is None or bool(v[ptr[i]:ptr[i + 1]].all())
+            if labelled and (self.cfg.freeze_from_labels or self.cfg.norm_from == "ref"):
+                ref = batch.y[ptr[i]:ptr[i + 1]]
+            elif not labelled and self.cfg.norm_from == "ref":
+                key = (d, round(float(vgs[i]), 6), round(float(vds[i]), 6))
+                if key not in self._ref:
+                    self._ref[key] = pred_phys[ptr[i]:ptr[i + 1]].detach().float().cpu()
+                ref = self._ref[key].to(pred_phys.device)
             tot, terms, merit = self.graph_terms(pred_phys[ptr[i]:ptr[i + 1]], d, vgs[i], vds[i], ref)
             total = tot if total is None else total + tot
             n += 1
